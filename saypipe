@@ -3,12 +3,12 @@
 # Copyright (c) 2026 Everett C. Haimes III
 # saypipe: run `waypipe [-n] -c zstd ssh <host> <command...>`
 #
-#   CLI:       saypipe <host> <command...>
-#   Via link:  ln -s saypipe myserver; myserver <command...>   (name = host)
+#   CLI:       saypipe <host> [<command...>]
+#   Via link:  saypipe --link-add myserver; myserver [<command...>]
 #
-# Launches run detached, so closing the terminal doesn't close the app. Real
-# failures (ssh errors, command not found) are appended to
-# ~/.local/state/saypipe/errors.log.
+# Launches run detached, so closing the terminal doesn't close the app. A
+# launch that fails right away (ssh error, command not found) is reported in
+# the terminal; failures are also appended to ~/.local/state/saypipe/errors.log.
 #
 # Waypipe options, per host:
 #   default      -n -c zstd   -n (--no-gpu) sends shm buffers, no dmabufs. Hosts
@@ -31,10 +31,10 @@
 # kept for SAYPIPE_SHARE_PERSIST, default 10m), so every session to the host
 # reuses one connection.
 #
-# Host links (--link) go in $SAYPIPE_BIN_DIR, default ~/.local/bin. Install
+# Host links (--link-add) go in $SAYPIPE_BIN_DIR, default ~/.local/bin. Install
 # and uninstall with install.sh.
 #
-# Needs bash (3.2 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
+# Needs bash (4.4 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
 
 set -u
 
@@ -44,6 +44,10 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/saypipe"
 GPU_HOSTS_FILE="$CONFIG_DIR/gpu-hosts"
 AUDIO_HOSTS_FILE="$CONFIG_DIR/audio-hosts"
 SHARE_HOSTS_FILE="$CONFIG_DIR/share-hosts"
+ALIASES_FILE="$CONFIG_DIR/aliases"
+COMMANDS_FILE="$CONFIG_DIR/commands"
+HOSTS_FILE="$CONFIG_DIR/hosts"
+SETTINGS_FILE="$CONFIG_DIR/settings"
 SHARE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/saypipe-$(id -u)}/saypipe/cm"
 ERROR_LOG="$STATE_DIR/errors.log"
 
@@ -51,6 +55,10 @@ name=${0##*/}
 name=${name%.sh}
 host=
 [ "$name" != "$SELF" ] && host=$name
+
+FORCE=0               # --force: enable hosts without checking for waypipe
+mgmt_rc=0             # exit status of management commands
+LINKS_MADE=0          # a link was created (for the PATH note)
 
 # resolve <path>: absolute path with all symlinks resolved (readlink -f where
 # available, else realpath, else a manual walk).
@@ -67,12 +75,40 @@ resolve() {
     printf '%s/%s\n' "$d" "${p##*/}"
 }
 
-# list_file <kind>: the host list file for "gpu", "audio" or "share".
+# die_soft <message>: report a failure for one item and carry on (exit 1 later).
+die_soft() { printf '%s: %s\n' "$SELF" "$*" >&2; mgmt_rc=1; }
+
+# usage_error <message>: wrong arguments; exit 2.
+usage_error() {
+    printf '%s: %s\n' "$SELF" "$*" >&2
+    printf "Try '%s --help'.\n" "$SELF" >&2
+    exit 2
+}
+
+# Host names become file names and ssh targets: keep them boring.
+valid_host() {
+    case $1 in ""|-*|.|..|"$SELF") return 1 ;; esac
+    [[ $1 =~ ^[A-Za-z0-9._@-]+$ ]]
+}
+
+# check_host <name> [what]: valid_host, with a message saying what's wrong.
+check_host() {
+    case $1 in
+        -*) die_soft "unknown option '$1'"; return 1 ;;
+        "") die_soft "empty ${2:-host} name"; return 1 ;;
+    esac
+    valid_host "$1" && return 0
+    die_soft "'$1' is not a valid ${2:-host} name (letters, digits, '.', '_', '@', '-')"
+    return 1
+}
+
+# list_file <kind>: the host list file for "gpu", "audio", "share" or "host".
 list_file() {
     case $1 in
         gpu)   printf '%s\n' "$GPU_HOSTS_FILE" ;;
         audio) printf '%s\n' "$AUDIO_HOSTS_FILE" ;;
         share) printf '%s\n' "$SHARE_HOSTS_FILE" ;;
+        host)  printf '%s\n' "$HOSTS_FILE" ;;
     esac
 }
 
@@ -101,6 +137,89 @@ is_gpu_host()   { host_listed gpu "$1"; }
 is_audio_host() { host_listed audio "$1"; }
 is_share_host() { host_listed share "$1"; }
 
+# setting_get <key> <default>: a value from SETTINGS_FILE ("<key> <value>"
+# lines, # comments), or <default>.
+setting_get() {
+    local l k v
+    if [ -r "$SETTINGS_FILE" ]; then
+        while IFS= read -r l || [ -n "$l" ]; do
+            read -r k v <<< "${l%%#*}"
+            if [ "${k:-}" = "$1" ] && [ -n "${v:-}" ]; then printf '%s\n' "$v"; return; fi
+        done < "$SETTINGS_FILE"
+    fi
+    printf '%s\n' "$2"
+}
+
+# setting_set <key> <value>: store a setting, replacing an old value
+# (rewritten in place, keeping permissions).
+setting_set() {
+    local l k v tmp
+    mkdir -p "${SETTINGS_FILE%/*}" || return 1
+    if [ ! -e "$SETTINGS_FILE" ]; then
+        printf '# saypipe settings: "<key> <value>" per line, # comments.\n' > "$SETTINGS_FILE" || return 1
+    fi
+    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-settings.XXXXXX") || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k v <<< "${l%%#*}"
+        [ "${k:-}" = "$1" ] || printf '%s\n' "$l"
+    done < "$SETTINGS_FILE" > "$tmp"
+    printf '%s %s\n' "$1" "$2" >> "$tmp"
+    cat "$tmp" > "$SETTINGS_FILE"; rm -f -- "$tmp"
+}
+
+# alias_target <name>: the host an alias stands for (ALIASES_FILE holds
+# "<alias> <host>" lines), or failure if <name> isn't an alias.
+alias_target() {
+    local l a t rest
+    [ -r "$ALIASES_FILE" ] || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r a t rest <<< "${l%%#*}"
+        if [ "${a:-}" = "$1" ] && [ -n "${t:-}" ]; then printf '%s\n' "$t"; return 0; fi
+    done < "$ALIASES_FILE"
+    return 1
+}
+
+# alias_names: every alias in ALIASES_FILE.
+alias_names() {
+    local l a rest
+    [ -r "$ALIASES_FILE" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r a rest <<< "${l%%#*}"
+        [ -n "${a:-}" ] && printf '%s\n' "$a"
+    done < "$ALIASES_FILE"
+}
+
+# real_host <name>: the host behind an alias, or <name> itself.
+real_host() { alias_target "$1" || printf '%s\n' "$1"; }
+
+# default_cmd <host>: the command <host> runs when none is given
+# (COMMANDS_FILE holds "<host> <command...>" lines, "*" for the global default;
+# a "user@host" target matches a "host" line). Fails if there is none.
+# Commands may contain '#', so only whole-line comments count.
+default_cmd() {
+    local l k rest
+    [ -r "$COMMANDS_FILE" ] || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k rest <<< "$l"
+        case ${k:-} in ""|"#"*) continue ;; esac
+        if { [ "$k" = "$1" ] || [ "$k" = "${1##*@}" ]; } && [ -n "${rest:-}" ]; then
+            printf '%s\n' "$rest"; return 0
+        fi
+    done < "$COMMANDS_FILE"
+    return 1
+}
+
+# default_hosts: hosts with a default command (not the global "*").
+default_hosts() {
+    local l k rest
+    [ -r "$COMMANDS_FILE" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k rest <<< "$l"
+        case ${k:-} in ""|"#"*|'*') continue ;; esac
+        [ -n "${rest:-}" ] && printf '%s\n' "$k"
+    done < "$COMMANDS_FILE"
+}
+
 # share_opts <host>: set SHARE_SSH to the ssh options for connection sharing
 # (one ControlMaster connection carrying every session to the host) if the
 # host is listed in share-hosts, else to nothing (ssh's own config applies).
@@ -115,6 +234,11 @@ share_opts() {
                -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 }
 
+# pulse_socket: the local PulseAudio (or pipewire-pulse) socket path.
+pulse_socket() {
+    printf '%s\n' "${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse}/native"
+}
+
 # audio_setup <host>: for an audio-enabled host, forward the local PulseAudio
 # socket to a random remote path over the same ssh connection and point the
 # remote app at it. Sets AUDIO_SSH (ssh options), AUDIO_ENV (command prefix)
@@ -122,7 +246,7 @@ share_opts() {
 AUDIO_SSH=(); AUDIO_ENV=(); AUDIO_RSOCK=; AUDIO_LSOCK=
 audio_setup() {
     is_audio_host "$1" || return 0
-    AUDIO_LSOCK="${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse}/native"
+    AUDIO_LSOCK=$(pulse_socket)
     if [ ! -S "$AUDIO_LSOCK" ]; then
         echo "$SELF: audio: no PulseAudio socket at $AUDIO_LSOCK; continuing without audio" >&2
         AUDIO_LSOCK=
@@ -160,42 +284,64 @@ wp_opts() {
 }
 
 usage() {
-    local LINK_DIR_HINT=${SAYPIPE_BIN_DIR:-~/.local/bin}
-    cat >&2 <<EOF
-Usage: $SELF <host> <command...>
-       <link-to-$SELF> <command...>      (link name is used as the host)
+    local d=${SAYPIPE_BIN_DIR:-~/.local/bin}
+    cat <<EOF
+Usage: $SELF [--] <host> [<command...>]
+       <host-link> [<command...>]
 
-Runs: waypipe -n -c zstd ssh <host> <command...>
-      or, for hosts listed in $GPU_HOSTS_FILE:
-      waypipe -c zstd ssh <host> <command...>
-      (SAYPIPE_OPTS replaces the waypipe options for every host)
-      Hosts listed in $AUDIO_HOSTS_FILE also get the local PulseAudio
-      socket forwarded (ssh -R) and PULSE_SERVER set for the app.
-      Launches run detached; real failures go to $ERROR_LOG.
+Runs <command> on <host> through waypipe over ssh, detached from the terminal.
+Everything after the host is the command. Without one, the host's default
+command runs (see --default-set). A launch that fails right away is reported
+here; failures are also logged to $ERROR_LOG.
 
-Management (as $SELF only):
-  $SELF --link <host>...        create <host> -> $SELF symlinks in $LINK_DIR_HINT
-  $SELF --unlink <host>...      remove such symlinks (only ones pointing here)
-  $SELF --gpu-add <host>...     let <host> use GPU buffers (run without -n)
-  $SELF --gpu-remove <host>...  back to -n for <host>
-  $SELF --gpu-list              list GPU-enabled hosts
-  $SELF --audio-add <host>...   play <host>'s app audio on this machine
-  $SELF --audio-remove <host>...
-  $SELF --audio-list            list audio-enabled hosts
-  $SELF --share-add <host>...   share one ssh connection for all <host> sessions
-  $SELF --share-remove <host>...
-  $SELF --share-list            list hosts with connection sharing
-  $SELF --share-exit <host>...  close the shared connection (closes its apps)
-  $SELF --list                  every known host, with GPU/audio/sharing notes
+Hosts:
+  --host-add [--force] <host>...   enable hosts, after checking they have
+                                   waypipe (--force skips the check)
+  --host-remove <host>...          remove hosts with all their options,
+                                   aliases and links
+  --list [<list>]                  enabled hosts with their options, or one
+                                   list: hosts gpu audio share aliases links
+                                   defaults
+  --probe [--apply] <host>...      test what hosts support; --apply enables it
+
+Host options (adding one enables the host; --force works here too):
+  --gpu-add <host>...              apps may share GPU buffers (no waypipe -n)
+  --gpu-remove <host>...
+  --audio-add <host>...            play the host's app audio on this machine
+  --audio-remove <host>...
+  --share-add <host>...            sessions to the host share one ssh connection
+  --share-remove <host>...
+  --share-exit <host>...           close a shared connection (closes its apps)
+  --default-set <host> <command...>
+                                   command the host runs when given none
+  --default-set --global <command...>
+                                   ... for hosts without a default of their own
+  --default-remove <host>...|--global
+  --alias-add <alias> <host>       <alias> connects to <host>; also links it
+  --alias-remove <alias>...        remove aliases and their links
+  --link-add <host>...             make <host> a command in $d
+  --link-remove <host>...
+
+Settings:
+  --completion-hosts [all|enabled] host completion offers all ssh config hosts
+                                   (default) or only enabled ones
+  -h, --help                       this help
+
+Environment: SAYPIPE_OPTS (waypipe options for every host), SAYPIPE_BIN_DIR
+(links), SAYPIPE_SHARE_PERSIST (shared connection lifetime, default 10m),
+SAYPIPE_WAIT (seconds to watch a launch for failure, default 2).
 EOF
 }
 
 # ---- worker -----------------------------------------------------------------
 
-# Internal: the detached worker. Runs waypipe and, on a real failure, appends
-# the tail of its output to ERROR_LOG (there is no terminal to show it on).
+# Internal: the detached worker. Runs waypipe; on a real failure appends the
+# tail of its output to ERROR_LOG. If the launching saypipe is still watching
+# (SAYPIPE_STATUS names a file it waits on), report the result there.
 if [ "${1:-}" = "--run" ]; then
+    [ $# -ge 3 ] || { echo "$SELF: --run is internal" >&2; exit 2; }
     host=$2; shift 2
+    status_file=${SAYPIPE_STATUS:-}; unset SAYPIPE_STATUS
     log=$(mktemp "${TMPDIR:-/tmp}/saypipe.XXXXXX") || log=/dev/null
     wp_opts "$host"
     share_opts "$host"
@@ -205,10 +351,14 @@ if [ "${1:-}" = "--run" ]; then
     rc=$?
     audio_cleanup "$host"
     # Apps often exit non-zero when their window is closed (e.g. foot gives 1),
-    # so only record codes that mean a real failure: 255 = ssh error,
-    # 127/126 = command not found / not executable.
-    case $rc in
-        255|127|126)
+    # so only record what means a real failure: 255 = ssh error, 127/126 =
+    # command not found / not executable, and waypipe's own "Failed to run
+    # program" (it exits 1 when the command doesn't exist on the host).
+    failed=0
+    case $rc in 255|127|126) failed=1 ;; esac
+    grep -q 'Failed to run program' "$log" 2>/dev/null && failed=1
+    case $failed in
+        1)
             if mkdir -p "$STATE_DIR" 2>/dev/null; then
                 {
                     printf '[%s] waypipe %s ssh %s %s: exit %s\n' \
@@ -217,11 +367,15 @@ if [ "${1:-}" = "--run" ]; then
                 } >> "$ERROR_LOG"
             fi ;;
     esac
+    if [ -n "$status_file" ] && [ -e "$status_file" ]; then
+        { echo "$rc"; tail -n 12 "$log" 2>/dev/null; } > "$status_file.new" &&
+            mv -f -- "$status_file.new" "$status_file"
+    fi
     [ "$log" = /dev/null ] || rm -f "$log"
     exit $rc
 fi
 
-# ---- management: --link/--unlink/--gpu-*/--audio-*/--share-*/--list ---------
+# ---- management -------------------------------------------------------------
 
 SCRIPT_PATH=$(resolve "$0")
 # Host links go where commands live, not next to the real script (which may be
@@ -238,20 +392,146 @@ link_target() {
     fi
 }
 
-die_soft() { printf '%s: %s\n' "$SELF" "$*" >&2; mgmt_rc=1; }
-
-# Host names become file names and ssh targets: keep them boring.
-valid_host() {
-    case $1 in ""|-*|.|..|"$SELF") return 1 ;; esac
-    [[ $1 =~ ^[A-Za-z0-9._@-]+$ ]]
-}
-
 # is_our_link <path>: a symlink that resolves to this script.
 is_our_link() { [ -L "$1" ] && [ "$(resolve "$1")" = "$SCRIPT_PATH" ]; }
 
+# link_names: names of host and alias links that point to this saypipe.
+link_names() {
+    local f
+    for f in "$LINK_DIR"/*; do
+        [ "${f##*/}" != "$SELF" ] && is_our_link "$f" && printf '%s\n' "${f##*/}"
+    done
+    return 0
+}
+
+# shadow_check <name> <what>: fail (with a message) if a link called <name>
+# can't be created: something else exists there, or it would shadow a command.
+shadow_check() {
+    local t=$LINK_DIR/$1
+    is_our_link "$t" && return 0
+    if [ -e "$t" ] || [ -L "$t" ]; then
+        die_soft "$t exists and isn't a $SELF link; pick another $2"; return 1
+    fi
+    if type -t -- "$1" >/dev/null 2>&1; then
+        die_soft "'$1' is already a command ($(type -t -- "$1"): $(command -v -- "$1")); pick another $2"
+        return 1
+    fi
+}
+
+# make_link <name>: create a <name> link to this saypipe in LINK_DIR.
+make_link() {
+    local t=$LINK_DIR/$1
+    is_our_link "$t" && return 0
+    mkdir -p -- "$LINK_DIR" || { die_soft "cannot create $LINK_DIR"; return 1; }
+    ln -s -- "$(link_target)" "$t" && LINKS_MADE=1 && echo "$1: linked ($t)"
+}
+
+# ---- enabled hosts ----------------------------------------------------------
+
+# enabled_hosts: every enabled host: the host list plus hosts that have
+# options (GPU, audio, sharing, a default command), alias targets and links.
+enabled_hosts() {
+    local n
+    {
+        list_entries host; list_entries gpu; list_entries audio; list_entries share
+        default_hosts
+        while IFS= read -r n; do alias_target "$n"; done < <(alias_names)
+        while IFS= read -r n; do real_host "$n"; done < <(link_names)
+    } | sort -u
+}
+
+# is_enabled <host>: enabled? ("user@host" matches "host")
+is_enabled() {
+    local l
+    while IFS= read -r l; do
+        [ "$l" = "$1" ] || [ "$l" = "${1##*@}" ] && return 0
+    done < <(enabled_hosts)
+    return 1
+}
+
+# waypipe_check <host>: reach <host> over ssh and check it has waypipe. Prints
+# the remote waypipe version, or why the check failed.
+waypipe_check() {
+    local out rc
+    share_opts "$1"
+    out=$(ssh "${SHARE_SSH[@]}" -o ConnectTimeout=10 "$1" sh -s 2>&1 <<'EOF'
+if command -v waypipe >/dev/null 2>&1; then waypipe --version 2>&1 | head -n 1
+else echo @@no-waypipe@@; fi
+EOF
+    ); rc=$?
+    if [ $rc -eq 255 ]; then printf 'cannot connect: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"; return 1; fi
+    case $out in
+        *@@no-waypipe@@*) echo "waypipe is not installed there"; return 1 ;;
+        "")               echo "no answer from the host"; return 1 ;;
+    esac
+    printf '%s\n' "$out" | tail -n 1
+}
+
+# ensure_enabled <host>: make sure <host> is enabled, checking first that it
+# has waypipe (unless --force). Fails, with a message, if it can't be.
+ensure_enabled() {
+    local h=$1 v
+    is_enabled "$h" && return 0
+    if [ "$FORCE" = 1 ]; then
+        list_append host "$h" && echo "$h: enabled (not checked: --force)"
+        return 0
+    fi
+    if v=$(waypipe_check "$h"); then
+        list_append host "$h" && echo "$h: enabled ($v)"
+    else
+        die_soft "$h: not enabled: $v (add --force to enable it without this check)"
+        return 1
+    fi
+}
+
+# host_add <host>...: enable hosts.
+host_add() {
+    local h
+    for h; do
+        check_host "$h" || continue
+        h=$(real_host "$h")
+        if is_enabled "$h"; then
+            host_listed host "$h" || list_append host "$h"     # record it
+            echo "$h: already enabled"
+        else
+            ensure_enabled "$h"
+        fi
+    done
+}
+
+# host_remove <host>...: remove hosts with all their options, aliases and links.
+host_remove() {
+    local h t kind a found
+    for h; do
+        check_host "$h" || continue
+        if t=$(alias_target "$h"); then
+            die_soft "'$h' is an alias for $t; use '$SELF --alias-remove $h' or '$SELF --host-remove $t'"
+            continue
+        fi
+        is_enabled "$h" || { die_soft "$h: not an enabled host"; continue; }
+        for kind in host gpu audio share; do
+            host_listed "$kind" "$h" && list_drop "$kind" "$h"
+        done
+        default_drop "$h"
+        while IFS= read -r a; do
+            [ "$(alias_target "$a")" = "$h" ] || continue
+            alias_drop "$a"
+            is_our_link "$LINK_DIR/$a" && rm -f -- "$LINK_DIR/$a"
+            echo "$h: alias $a removed"
+        done < <(alias_names)
+        if is_our_link "$LINK_DIR/$h"; then rm -f -- "$LINK_DIR/$h" && echo "$h: link removed"; fi
+        echo "$h: removed (with its options)"
+    done
+}
+
+# ---- option lists (gpu, audio, share, host) ---------------------------------
+
 # list_label <kind>: how messages name the feature.
 list_label() {
-    case $1 in gpu) echo GPU ;; audio) echo audio ;; share) echo "connection sharing" ;; esac
+    case $1 in
+        gpu) echo GPU ;; audio) echo audio ;; share) echo "connection sharing" ;;
+        host) echo "enabled" ;;
+    esac
 }
 
 list_file_init() {
@@ -279,6 +559,13 @@ EOF
 # pipewire-pulse or PulseAudio) and sshd with AllowStreamLocalForwarding.
 EOF
         ;;
+        host) cat > "$f" <<'EOF'
+# saypipe's enabled hosts, added with `saypipe --host-add` once they were
+# confirmed to have waypipe. Options (gpu-hosts, audio-hosts, share-hosts,
+# commands, aliases) apply to enabled hosts; hosts that have options count as
+# enabled too. One host per line; blank lines and # comments are ignored.
+EOF
+        ;;
         share) cat > "$f" <<'EOF'
 # Hosts whose saypipe sessions share one ssh connection (ControlMaster):
 # faster launches, and quick launches don't trip ssh rate limits such as
@@ -290,18 +577,42 @@ EOF
     esac
 }
 
-# list_add <kind> <host>...
-list_add() {
-    local kind=$1 label h f; shift
+# list_append <kind> <host>: add one entry (no checks, no message).
+list_append() {
+    local f
+    list_file_init "$1" || { die_soft "cannot create $(list_file "$1")"; return 1; }
+    f=$(list_file "$1")
+    # make sure the file ends with a newline before appending
+    [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && echo >> "$f"
+    printf '%s\n' "$2" >> "$f" || { die_soft "cannot write $f"; return 1; }
+}
+
+# list_drop <kind> <entry>: remove exact entries (rewritten in place, keeping
+# the file's permissions and any symlink). Fails if there was none.
+list_drop() {
+    local f tmp l s found=0
+    f=$(list_file "$1")
+    [ -r "$f" ] || return 1
+    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-list.XXXXXX") || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        s=${l%%#*}; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+        if [ "$s" = "$2" ]; then found=1; else printf '%s\n' "$l"; fi
+    done < "$f" > "$tmp"
+    [ $found -eq 0 ] || cat "$tmp" > "$f"
+    rm -f -- "$tmp"
+    [ $found -eq 1 ]
+}
+
+# option_add <kind> <host>...: enable an option (enabling the host first).
+option_add() {
+    local kind=$1 label h; shift
     label=$(list_label "$kind")
-    list_file_init "$kind" || { die_soft "cannot create $(list_file "$kind")"; return; }
-    f=$(list_file "$kind")
     for h; do
-        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        check_host "$h" || continue
+        h=$(real_host "$h")                         # options follow the real host
         if host_listed "$kind" "$h"; then echo "$h: $label already enabled"; continue; fi
-        # make sure the file ends with a newline before appending
-        [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && echo >> "$f"
-        printf '%s\n' "$h" >> "$f" || { die_soft "cannot write $f"; continue; }
+        ensure_enabled "$h" || continue
+        list_append "$kind" "$h" || continue
         case $kind in
             gpu)   echo "$h: GPU enabled (runs without -n)" ;;
             audio) echo "$h: audio enabled (sound plays on this machine)" ;;
@@ -310,152 +621,619 @@ list_add() {
     done
 }
 
-# list_remove <kind> <host>...
-list_remove() {
-    local kind=$1 label h f tmp l s found; shift
+# option_remove <kind> <host>...
+option_remove() {
+    local kind=$1 label h e; shift
     label=$(list_label "$kind")
-    f=$(list_file "$kind")
-    [ -r "$f" ] || { for h; do echo "$h: $label not enabled"; done; return; }
     for h; do
-        found=0
-        tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-list.XXXXXX") || { die_soft "cannot write $f"; return; }
-        while IFS= read -r l || [ -n "$l" ]; do
-            s=${l%%#*}; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
-            if [ "$s" = "$h" ]; then found=1; else printf '%s\n' "$l"; fi
-        done < "$f" > "$tmp"
-        if [ $found -eq 1 ]; then
-            # Rewrite in place: keeps the file's permissions and any symlink.
-            cat "$tmp" > "$f" || { rm -f -- "$tmp"; die_soft "cannot write $f"; continue; }
+        check_host "$h" || continue
+        h=$(real_host "$h")
+        if list_drop "$kind" "$h"; then
             case $kind in
                 gpu)   echo "$h: GPU disabled (runs with -n)" ;;
                 audio) echo "$h: audio disabled" ;;
                 share) echo "$h: connection sharing disabled" \
                             "(an open master stays until '$SELF --share-exit $h' or it times out)" ;;
             esac
-        else
-            echo "$h: not listed"
-        fi
-        rm -f -- "$tmp"
-        host_listed "$kind" "$h" &&
-            die_soft "$h: $label still enabled via another entry (e.g. without user@)"
-    done
-}
-
-link_add() {
-    local h t tgt
-    mkdir -p -- "$LINK_DIR" || { die_soft "cannot create $LINK_DIR"; return; }
-    tgt=$(link_target)
-    for h; do
-        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
-        t=$LINK_DIR/$h
-        if is_our_link "$t"; then echo "$h: link already exists"; continue; fi
-        if [ -e "$t" ] || [ -L "$t" ]; then
-            die_soft "$t exists and is not a $SELF link; not touching it"; continue
-        fi
-        if type -t -- "$h" >/dev/null 2>&1; then
-            die_soft "'$h' is already a command ($(type -t -- "$h"): $(command -v -- "$h")); a link would shadow it"
+            host_listed "$kind" "$h" &&
+                die_soft "$h: $label is still enabled through another entry (e.g. without user@)"
             continue
         fi
-        ln -s -- "$tgt" "$t" && echo "$h: linked ($t -> $tgt)"
+        # "rett@myvm" lines match "myvm" only one way round: point to them.
+        e=$(list_entries "$kind" | while IFS= read -r e; do
+                [ "${e##*@}" = "$h" ] && { printf '%s\n' "$e"; break; }; done)
+        if [ -n "$e" ]; then die_soft "$h: $label is enabled as '$e'; remove that entry instead"
+        else die_soft "$h: $label not enabled"; fi
     done
-    case ":$PATH:" in *":$LINK_DIR:"*) ;; *) echo "note: $LINK_DIR is not in PATH" >&2 ;; esac
 }
 
+# ---- links and aliases -------------------------------------------------------
+
+# link_add <host>...: make hosts commands in LINK_DIR.
+link_add() {
+    local h
+    for h; do
+        check_host "$h" || continue
+        if is_our_link "$LINK_DIR/$h"; then echo "$h: link already exists"; continue; fi
+        shadow_check "$h" "host name, or use --alias-add" || continue
+        if ! alias_target "$h" >/dev/null; then ensure_enabled "$h" || continue; fi
+        make_link "$h"
+    done
+}
+
+# link_remove <host>...: remove host links (alias links go with --alias-remove).
 link_remove() {
     local h t
     for h; do
-        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        check_host "$h" || continue
+        if t=$(alias_target "$h"); then
+            die_soft "'$h' is an alias for $t; use '$SELF --alias-remove $h'"; continue
+        fi
         t=$LINK_DIR/$h
         if is_our_link "$t"; then rm -f -- "$t" && echo "$h: link removed"
-        elif [ -e "$t" ] || [ -L "$t" ]; then die_soft "$t is not a $SELF link; not touching it"
-        else echo "$h: no link"
+        elif [ -e "$t" ] || [ -L "$t" ]; then die_soft "$t isn't a $SELF link; not touching it"
+        else die_soft "$h: no link"
         fi
     done
 }
 
-# list_all: every known host once (linked, GPU, audio or shared), sorted, with notes.
-list_all() {
-    local f n notes
-    {
-        for f in "$LINK_DIR"/*; do
-            [ "${f##*/}" != "$SELF" ] && is_our_link "$f" && printf '%s\n' "${f##*/}"
-        done
-        list_entries gpu
-        list_entries audio
-        list_entries share
-    } | sort -u | while IFS= read -r n; do
-        notes=()
-        is_gpu_host "$n" && notes+=(GPU)
-        is_audio_host "$n" && notes+=(audio)
-        if is_share_host "$n"; then
-            share_opts "$n"
-            if ssh "${SHARE_SSH[@]}" -O check "$n" >/dev/null 2>&1
-            then notes+=("shared (connected)"); else notes+=(shared); fi
+# alias_drop <alias>: remove an alias's line from ALIASES_FILE (rewritten in
+# place, keeping permissions). Fails if there was no such alias.
+alias_drop() {
+    local l a rest tmp found=0
+    [ -r "$ALIASES_FILE" ] || return 1
+    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-alias.XXXXXX") || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r a rest <<< "${l%%#*}"
+        if [ "${a:-}" = "$1" ]; then found=1; else printf '%s\n' "$l"; fi
+    done < "$ALIASES_FILE" > "$tmp"
+    [ $found -eq 0 ] || cat "$tmp" > "$ALIASES_FILE"
+    rm -f -- "$tmp"
+    [ $found -eq 1 ]
+}
+
+# alias_add <alias> <host>: record that <alias> means <host> and link it, for
+# a host whose name clashes with a command or that you'd rather call
+# something else.
+alias_add() {
+    local a=$1 h=$2 old
+    check_host "$a" alias || return
+    check_host "$h" || return
+    [ "$a" != "$h" ] || { die_soft "the alias is the host name; use '$SELF --link-add $h'"; return; }
+    if old=$(alias_target "$h"); then
+        die_soft "'$h' is itself an alias (for $old); give the real host"; return
+    fi
+    if ! alias_target "$a" >/dev/null && is_enabled "$a"; then
+        die_soft "'$a' is an enabled host; pick another alias"; return
+    fi
+    shadow_check "$a" alias || return
+    ensure_enabled "$h" || return
+    if old=$(alias_target "$a") && [ "$old" = "$h" ]; then
+        echo "$a: already an alias for $h"
+    else
+        [ -z "$old" ] || alias_drop "$a"
+        mkdir -p "${ALIASES_FILE%/*}" || { die_soft "cannot create ${ALIASES_FILE%/*}"; return; }
+        if [ ! -e "$ALIASES_FILE" ]; then
+            cat > "$ALIASES_FILE" <<'EOF'
+# saypipe host aliases: one "<alias> <host>" per line, # comments allowed.
+# `<alias> <command>` (a link made by `saypipe --alias-add`) and
+# `saypipe <alias> <command>` connect to <host>. GPU, audio and sharing
+# settings follow <host>.
+EOF
         fi
-        if [ ${#notes[@]} -eq 0 ]; then
-            printf '%s\n' "$n"
+        [ -s "$ALIASES_FILE" ] && [ -n "$(tail -c 1 "$ALIASES_FILE")" ] && echo >> "$ALIASES_FILE"
+        printf '%s %s\n' "$a" "$h" >> "$ALIASES_FILE" || { die_soft "cannot write $ALIASES_FILE"; return; }
+        echo "$a: alias for $h${old:+ (was $old)}"
+    fi
+    make_link "$a"
+}
+
+# alias_remove <alias>...: remove aliases and their links.
+alias_remove() {
+    local a
+    for a; do
+        check_host "$a" alias || continue
+        if alias_drop "$a"; then
+            is_our_link "$LINK_DIR/$a" && rm -f -- "$LINK_DIR/$a"
+            echo "$a: alias removed"
         else
-            printf '%-20s %s\n' "$n" "$(IFS=,; echo "${notes[*]}" | sed 's/,/, /g')"
+            die_soft "$a: not an alias"
         fi
     done
 }
+
+# ---- default commands ----------------------------------------------------------
+
+# default_drop <key>: remove a default command line (a host, or "*" for the
+# global one) from COMMANDS_FILE (rewritten in place). Fails if there was none.
+default_drop() {
+    local l k rest tmp found=0
+    [ -r "$COMMANDS_FILE" ] || return 1
+    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-cmd.XXXXXX") || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k rest <<< "$l"
+        if [ "${k:-}" = "$1" ]; then found=1; else printf '%s\n' "$l"; fi
+    done < "$COMMANDS_FILE" > "$tmp"
+    [ $found -eq 0 ] || cat "$tmp" > "$COMMANDS_FILE"
+    rm -f -- "$tmp"
+    [ $found -eq 1 ]
+}
+
+# default_set <key> <command...>: store the command a host (or "*", the global
+# default) runs when given none, replacing an old one.
+default_set() {
+    local h=$1 c old label; shift
+    c="$*"
+    case $c in *$'\n'*) die_soft "the command must be on one line"; return ;; esac
+    [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
+    if [ "$h" = '*' ]; then
+        label="global"
+    else
+        check_host "$h" || return
+        h=$(real_host "$h") label=$(real_host "$h")   # defaults follow the real host
+        ensure_enabled "$h" || return
+    fi
+    old=$(default_cmd "$h") || old=
+    [ -z "$old" ] || default_drop "$h"
+    mkdir -p "${COMMANDS_FILE%/*}" || { die_soft "cannot create ${COMMANDS_FILE%/*}"; return; }
+    if [ ! -e "$COMMANDS_FILE" ]; then
+        cat > "$COMMANDS_FILE" <<'EOF'
+# saypipe default commands: "<host> <command...>" per line. Running a host
+# (or an alias for it) without a command runs this one. A "*" line is the
+# global default, used for hosts without one. Only whole-line comments:
+# commands may contain '#'.
+EOF
+    fi
+    [ -s "$COMMANDS_FILE" ] && [ -n "$(tail -c 1 "$COMMANDS_FILE")" ] && echo >> "$COMMANDS_FILE"
+    printf '%s %s\n' "$h" "$c" >> "$COMMANDS_FILE" || { die_soft "cannot write $COMMANDS_FILE"; return; }
+    echo "$label: default command: $c${old:+ (was: $old)}"
+}
+
+# default_remove <host>...
+default_remove() {
+    local h
+    for h; do
+        if [ "$h" = '*' ]; then
+            if default_drop '*'; then echo "global default command removed"
+            else die_soft "no global default command"; fi
+            continue
+        fi
+        check_host "$h" || continue
+        h=$(real_host "$h")
+        if default_drop "$h"; then echo "$h: default command removed"
+        else die_soft "$h: no default command"; fi
+    done
+}
+
+# ---- listing -------------------------------------------------------------------
+
+# list_all: enabled hosts and aliases, sorted, with their options.
+list_all() {
+    local n t c shown joined notes
+    {
+        enabled_hosts
+        alias_names
+    } | sort -u | while IFS= read -r n; do
+        notes=() t=$n shown=$n joined=
+        if t=$(alias_target "$n"); then shown="$n -> $t"; else t=$n; fi
+        is_gpu_host "$t" && notes+=(GPU)
+        is_audio_host "$t" && notes+=(audio)
+        if is_share_host "$t"; then
+            share_opts "$t"
+            if ssh "${SHARE_SSH[@]}" -O check "$t" >/dev/null 2>&1
+            then notes+=("shared (connected)"); else notes+=(shared); fi
+        fi
+        if c=$(default_cmd "$t"); then notes+=("runs: $c")
+        elif c=$(default_cmd '*'); then notes+=("runs: $c (global default)")
+        fi
+        if [ ${#notes[@]} -eq 0 ]; then
+            printf '%s\n' "$shown"
+        else
+            for c in "${notes[@]}"; do joined+="${joined:+, }$c"; done
+            printf '%-20s %s\n' "$shown" "$joined"
+        fi
+    done
+}
+
+# list_cmd [<list>]: --list.
+list_cmd() {
+    local a n c
+    case ${1:-} in
+        "")              list_all ;;
+        hosts)           enabled_hosts ;;
+        gpu|audio|share) list_entries "$1" ;;
+        aliases)
+            while IFS= read -r a; do
+                printf '%-20s -> %s\n' "$a" "$(alias_target "$a")"
+            done < <(alias_names) ;;
+        links)           link_names ;;
+        defaults)
+            if c=$(default_cmd '*'); then printf '%-20s %s\n' "* (global)" "$c"; fi
+            while IFS= read -r n; do
+                printf '%-20s %s\n' "$n" "$(default_cmd "$n")"
+            done < <(default_hosts) ;;
+        *) usage_error "unknown list '$1' (hosts, gpu, audio, share, aliases, links or defaults)" ;;
+    esac
+}
+
+# ---- shell completion -------------------------------------------------------
+
+# ssh_config_hosts [file] [depth]: concrete Host names from the ssh config,
+# following Include (relative paths are under ~/.ssh). Patterns (*, ?, !)
+# are skipped.
+ssh_config_hosts() {
+    local f=${1:-$HOME/.ssh/config} depth=${2:-0} l key rest tok g toks
+    [ "$depth" -lt 8 ] && [ -r "$f" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r key rest <<< "${l%%#*}"
+        if [[ ${key:-} == *=* ]]; then rest="${key#*=} ${rest:-}"; key=${key%%=*}; fi
+        read -ra toks <<< "${rest:-}"               # read -a doesn't glob
+        case ${key,,} in
+            host)
+                for tok in ${toks[@]+"${toks[@]}"}; do
+                    case $tok in *[\*\?\!]*) ;; *) printf '%s\n' "$tok" ;; esac
+                done ;;
+            include)
+                for tok in ${toks[@]+"${toks[@]}"}; do
+                    case $tok in "~/"*) tok=$HOME/${tok#\~/} ;; /*) ;; *) tok=$HOME/.ssh/$tok ;; esac
+                    for g in $tok; do ssh_config_hosts "$g" $((depth + 1)); done   # glob on purpose
+                done ;;
+        esac
+    done < "$f"
+}
+
+# complete_list <kind>: candidates for shell completion (completions/*).
+complete_list() {
+    case $1 in
+        hosts)                    # enabled hosts (and aliases) first, then the rest
+            complete_list enabled
+            complete_list other ;;
+        enabled)                  # enabled hosts, aliases and host links
+            { enabled_hosts; alias_names; link_names; } | sort -u ;;
+        enabled-hosts) enabled_hosts ;;
+        other)                    # ssh config hosts that aren't enabled
+            [ "$(setting_get completion-hosts all)" = all ] || return 0
+            awk 'NR == FNR { seen[$0] = 1; next } !seen[$0]' \
+                <(complete_list enabled) \
+                <({ ssh_config_hosts; ssh_config_hosts /etc/ssh/ssh_config; } | sort -u) ;;
+        gpu|audio|share) list_entries "$1" ;;
+        aliases)  alias_names ;;
+        defaults) default_hosts ;;
+        links)    while IFS= read -r n; do alias_target "$n" >/dev/null || printf '%s\n' "$n"; done < <(link_names) ;;
+        lists)    printf '%s\n' hosts gpu audio share aliases links defaults ;;
+        options)
+            printf '%s\n' --host-add --host-remove --list --probe --gpu-add --gpu-remove \
+                --audio-add --audio-remove --share-add --share-remove --share-exit \
+                --default-set --default-remove --alias-add --alias-remove --link-add \
+                --link-remove --completion-hosts --help ;;
+    esac
+    return 0
+}
+
+# ---- shared connections --------------------------------------------------------
 
 # share_exit <host>...: close saypipe's shared connection to each host.
 share_exit() {
     local h
     for h; do
-        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        check_host "$h" || continue
+        h=$(real_host "$h")
         share_opts "$h" force
         if ssh "${SHARE_SSH[@]}" -O check "$h" >/dev/null 2>&1; then
             ssh "${SHARE_SSH[@]}" -O exit "$h" >/dev/null 2>&1 &&
                 echo "$h: shared connection closed (its apps close with it)"
         else
-            echo "$h: no shared connection open"
+            die_soft "$h: no shared connection open"
         fi
     done
 }
 
-if [ -z "$host" ]; then
-    mgmt_rc=0
-    case "${1:-}" in
-        --link|--unlink|--gpu-add|--gpu-remove|--audio-add|--audio-remove|\
-        --share-add|--share-remove|--share-exit)
-            op=$1; shift
-            [ $# -gt 0 ] || { echo "$SELF: $op needs at least one host" >&2; exit 2; }
-            case $op in
-                --link)         link_add "$@" ;;
-                --unlink)       link_remove "$@" ;;
-                --gpu-add)      list_add gpu "$@" ;;
-                --gpu-remove)   list_remove gpu "$@" ;;
-                --audio-add)    list_add audio "$@" ;;
-                --audio-remove) list_remove audio "$@" ;;
-                --share-add)    list_add share "$@" ;;
-                --share-remove) list_remove share "$@" ;;
-                --share-exit)   share_exit "$@" ;;
+# ---- probe ------------------------------------------------------------------
+
+# Facts gathered on the remote host (POSIX sh, run with `sh -s` so the login
+# shell doesn't matter). One "key=value" per line.
+PROBE_REMOTE='
+if command -v waypipe >/dev/null 2>&1; then
+    v=$(waypipe --version 2>&1)
+    printf "waypipe=%s\n" "$(printf "%s\n" "$v" | head -n 1)"
+    case $v in *"dmabuf: true"*) echo dmabuf=yes ;; *"dmabuf: false"*) echo dmabuf=no ;; esac
+else
+    echo waypipe=
+fi
+for n in /dev/dri/renderD*; do
+    [ -c "$n" ] || continue
+    if [ -r "$n" ] && [ -w "$n" ]; then echo "render=$n"; else echo "render_noaccess=$n"; fi
+done
+if command -v vulkaninfo >/dev/null 2>&1; then
+    echo vulkaninfo=yes
+    vulkaninfo --summary 2>/dev/null | awk -F"= *" "/deviceType/ {t=\$2} /deviceName/ {print \"vkdev=\" t \"|\" \$2}"
+fi
+'
+
+# probe_row <name> <result> [<detail>]
+probe_row() {
+    if [ -n "${3:-}" ]; then printf '  %-8s %-7s %s\n' "$1" "$2" "$3"
+    else printf '  %-8s %s\n' "$1" "$2"; fi
+}
+
+# probe_host <host> <apply>: test ssh, connection sharing, GPU and audio support
+# on <host> over one temporary shared connection (one TCP connection in total,
+# so ssh rate limits aren't tripped), print the results and what to enable.
+probe_host() {
+    local h=$1 apply=$2 dir m key val facts res
+    local wp='' dmabuf='' render='' noaccess='' vulkaninfo='' hwdev='' cpudev=''
+    local share=no share_why gpu=no gpu_why audio=no audio_why lsock rsock out
+    local feat enabled=() suggest=() wrong=() shown=() f add_host=0
+
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-probe.XXXXXX") || { die_soft "cannot create a temp dir"; return; }
+    m=(-o "ControlPath=$dir/%C" -o ConnectTimeout=10)
+    echo "$h"
+    if ! ssh "${m[@]}" -o ControlMaster=yes -o ControlPersist=no -fN "$h"; then
+        probe_row ssh FAILED "cannot connect (see the ssh error above)"
+        rm -rf -- "$dir"; mgmt_rc=1; return
+    fi
+    probe_row ssh ok "connected"
+
+    # Everything else runs as extra sessions over that connection; if they
+    # work, connection sharing works.
+    if facts=$(ssh "${m[@]}" -o ControlMaster=no "$h" sh -s <<< "$PROBE_REMOTE"); then
+        share=yes; share_why="extra sessions reuse one connection"
+    else
+        share_why="sessions over a shared connection failed"
+        facts=$(ssh "${m[@]}" -o ControlMaster=no -o ControlPath=none "$h" sh -s <<< "$PROBE_REMOTE") || facts=
+    fi
+    while IFS='=' read -r key val; do
+        case $key in
+            waypipe)         wp=$val ;;
+            dmabuf)          dmabuf=$val ;;
+            render)          render=${render:-$val} ;;
+            render_noaccess) noaccess=${noaccess:-$val} ;;
+            vulkaninfo)      vulkaninfo=yes ;;
+            vkdev)           case $val in *CPU*) cpudev=${cpudev:-${val#*|}} ;;
+                                          *)     hwdev=${hwdev:-${val#*|}} ;; esac ;;
+        esac
+    done <<< "$facts"
+
+    if [ -n "$wp" ]; then probe_row waypipe ok "$wp${dmabuf:+ (dmabuf: $dmabuf)}"
+    else probe_row waypipe MISSING "install waypipe on $h"; fi
+
+    # GPU: waypipe needs dmabuf support, an accessible render node and a
+    # hardware Vulkan device (software Vulkan can't share GPU buffers).
+    if [ "$dmabuf" = no ]; then gpu_why="waypipe on $h is built without dmabuf"
+    elif [ -z "$render" ] && [ -n "$noaccess" ]; then gpu_why="no access to $noaccess (add the user to the render/video group)"
+    elif [ -z "$render" ]; then gpu_why="no GPU render node (/dev/dri/renderD*)"
+    elif [ -n "$hwdev" ]; then gpu=yes; gpu_why="$hwdev on $render"
+    elif [ -n "$vulkaninfo" ]; then gpu_why="only software Vulkan${cpudev:+ ($cpudev)} on $render"
+    else gpu=likely; gpu_why="render node $render; install vulkaninfo on $h to confirm Vulkan"
+    fi
+
+    # Audio: forward the local PulseAudio socket and talk to it from the host.
+    lsock=$(pulse_socket)
+    if [ ! -S "$lsock" ]; then
+        audio_why="no local PulseAudio socket at $lsock"
+    else
+        rsock=/tmp/saypipe-probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').sock
+        if out=$(ssh "${m[@]}" -o ControlMaster=no -o ExitOnForwardFailure=yes \
+                     -R "$rsock:$lsock" "$h" sh -s 2>/dev/null <<EOF
+if command -v pactl >/dev/null 2>&1; then
+    PULSE_SERVER=unix:$rsock pactl info 2>/dev/null | sed -n 's/^Server Name: //p'
+elif [ -S $rsock ]; then
+    if ls /usr/lib/libpulse.so.0 /usr/lib*/libpulse.so.0 /usr/lib/*/libpulse.so.0 >/dev/null 2>&1
+    then echo socket+libpulse; else echo socket-only; fi
+fi
+rm -f $rsock
+EOF
+        ); then
+            case $out in
+                "")             audio_why="forwarded, but nothing on $h could talk to it" ;;
+                socket+libpulse) audio=yes; audio_why="socket forwarding works; libpulse present" ;;
+                socket-only)    audio_why="socket forwarding works, but no libpulse/pactl on $h" ;;
+                *)              audio=yes; audio_why="reached local sound server: $out" ;;
             esac
-            exit $mgmt_rc ;;
-        --gpu-list)   list_entries gpu; exit 0 ;;
-        --audio-list) list_entries audio; exit 0 ;;
-        --share-list) list_entries share; exit 0 ;;
-        --list)       list_all; exit 0 ;;
-        --*)        [ "$1" = --help ] || { echo "$SELF: unknown option $1" >&2; usage; exit 2; } ;;
+        else
+            audio_why="sshd on $h refused the socket forward (AllowStreamLocalForwarding?)"
+        fi
+    fi
+    ssh "${m[@]}" -O exit "$h" >/dev/null 2>&1
+    rm -rf -- "$dir"
+
+    probe_row shared "$share" "$share_why"
+    probe_row gpu "$gpu" "$gpu_why"
+    probe_row audio "$audio" "$audio_why"
+
+    for feat in share gpu audio; do
+        case $feat in share) res=$share ;; gpu) res=$gpu ;; audio) res=$audio ;; esac
+        if host_listed "$feat" "$h"; then
+            enabled+=("$feat")
+            [ "$res" = no ] && wrong+=("$feat")
+        elif [ "$res" = yes ]; then
+            suggest+=("$feat")
+        fi
+    done
+    for f in ${enabled[@]+"${enabled[@]}"}; do
+        case $f in share) shown+=(shared) ;; *) shown+=("$f") ;; esac
+    done
+    if is_enabled "$h"; then probe_row host enabled
+    elif [ -n "$wp" ] && [ "$apply" = 1 ]; then
+        list_append host "$h" && probe_row host enabled "(added)"
+    elif [ -n "$wp" ]; then
+        probe_row host "-" "not enabled"; add_host=1
+    else
+        probe_row host "-" "not enabled (needs waypipe)"; suggest=()
+    fi
+    if [ ${#shown[@]} -gt 0 ]; then probe_row options "$(IFS=,; echo "${shown[*]}" | sed 's/,/, /g')"
+    else probe_row options none; fi
+    if [ ${#suggest[@]} -gt 0 ]; then
+        if [ "$apply" = 1 ]; then
+            for feat in "${suggest[@]}"; do option_add "$feat" "$h" | sed 's/^/  /'; done
+        else
+            for feat in "${suggest[@]}"; do echo "  -> $SELF --$feat-add $h"; done
+        fi
+    elif [ $add_host = 1 ]; then
+        echo "  -> $SELF --host-add $h"       # (any --*-add above enables it too)
+    fi
+    for feat in ${wrong[@]+"${wrong[@]}"}; do
+        echo "  !  $feat is enabled but not supported here: $SELF --$feat-remove $h"
+    done
+}
+
+# probe <apply> <host>...
+probe() {
+    local apply=$1 h t; shift
+    for h; do
+        check_host "$h" || continue
+        if t=$(alias_target "$h"); then echo "($h is an alias for $t)"; h=$t; fi
+        probe_host "$h" "$apply"
+    done
+}
+
+# ---- command line ---------------------------------------------------------------
+
+# take_flag <flag>: remove every <flag> from ARGS; succeeds if there was one.
+ARGS=()
+take_flag() {
+    local a found=1 rest=()
+    for a in ${ARGS[@]+"${ARGS[@]}"}; do
+        if [ "$a" = "$1" ]; then found=0; else rest+=("$a"); fi
+    done
+    ARGS=(${rest[@]+"${rest[@]}"})
+    return $found
+}
+
+# need_hosts <option>: ARGS must hold at least one host.
+need_hosts() { [ ${#ARGS[@]} -gt 0 ] || usage_error "$1 needs at least one host"; }
+
+if [ -z "$host" ] && [ $# -gt 0 ] && [[ $1 == -* ]] && [ "$1" != -- ]; then
+    op=$1; shift
+    ARGS=("$@")
+    case $op in
+        -h|--help)
+            [ $# -eq 0 ] || usage_error "$op takes no arguments"
+            usage; exit 0 ;;
+        --host-add|--gpu-add|--audio-add|--share-add|--link-add)
+            take_flag --force && FORCE=1
+            need_hosts "$op"
+            case $op in
+                --host-add)  host_add "${ARGS[@]}" ;;
+                --gpu-add)   option_add gpu "${ARGS[@]}" ;;
+                --audio-add) option_add audio "${ARGS[@]}" ;;
+                --share-add) option_add share "${ARGS[@]}" ;;
+                --link-add)  link_add "${ARGS[@]}" ;;
+            esac ;;
+        --host-remove|--gpu-remove|--audio-remove|--share-remove|--share-exit|\
+        --link-remove|--alias-remove)
+            need_hosts "$op"
+            case $op in
+                --host-remove)  host_remove "${ARGS[@]}" ;;
+                --gpu-remove)   option_remove gpu "${ARGS[@]}" ;;
+                --audio-remove) option_remove audio "${ARGS[@]}" ;;
+                --share-remove) option_remove share "${ARGS[@]}" ;;
+                --share-exit)   share_exit "${ARGS[@]}" ;;
+                --link-remove)  link_remove "${ARGS[@]}" ;;
+                --alias-remove) alias_remove "${ARGS[@]}" ;;
+            esac ;;
+        --alias-add)
+            take_flag --force && FORCE=1
+            [ ${#ARGS[@]} -eq 2 ] || usage_error "usage: $SELF --alias-add [--force] <alias> <host>"
+            alias_add "${ARGS[0]}" "${ARGS[1]}" ;;
+        --default-set)
+            # options go before the host; everything after it is the command
+            global=0
+            while [ $# -gt 0 ]; do
+                case $1 in --force) FORCE=1; shift ;; --global) global=1; shift ;; *) break ;; esac
+            done
+            if [ $global = 1 ]; then
+                [ $# -ge 1 ] || usage_error "usage: $SELF --default-set --global <command...>"
+                default_set '*' "$@"
+            else
+                [ $# -ge 2 ] || usage_error "usage: $SELF --default-set [--force] <host> <command...>"
+                default_set "$@"
+            fi ;;
+        --default-remove)
+            if take_flag --global; then
+                [ ${#ARGS[@]} -eq 0 ] || usage_error "--default-remove --global takes no hosts"
+                default_remove '*'
+            else
+                need_hosts "$op"
+                default_remove "${ARGS[@]}"
+            fi ;;
+        --list)
+            [ $# -le 1 ] || usage_error "--list takes at most one list name"
+            list_cmd "${1:-}" ;;
+        --probe)
+            apply=0; take_flag --apply && apply=1
+            need_hosts "$op"
+            probe "$apply" "${ARGS[@]}" ;;
+        --completion-hosts)
+            [ $# -le 1 ] || usage_error "usage: $SELF --completion-hosts [all|enabled]"
+            case ${1:-} in
+                "")          echo "completion-hosts $(setting_get completion-hosts all)" ;;
+                all|enabled) setting_set completion-hosts "$1" && echo "completion-hosts $1" ;;
+                *)           usage_error "usage: $SELF --completion-hosts [all|enabled]" ;;
+            esac ;;
+        --complete)                       # internal, for completions/*
+            complete_list "${1:-}" 2>/dev/null; exit 0 ;;
+        *)
+            usage_error "unknown option '$op'" ;;
     esac
+    if [ "$LINKS_MADE" = 1 ]; then
+        case ":$PATH:" in *":$LINK_DIR:"*) ;; *) echo "note: $LINK_DIR is not in PATH" >&2 ;; esac
+    fi
+    exit $mgmt_rc
 fi
 
 # ---- launch -----------------------------------------------------------------
 
-case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+# launch <host> <command...>: start the detached worker and watch it for
+# SAYPIPE_WAIT seconds (default 2), so a launch that fails right away (ssh
+# error, command not found) is reported here instead of only in ERROR_LOG.
+launch() {
+    local h=$1 status rc step=0.1 max n=0
+    status=$(mktemp "${TMPDIR:-/tmp}/saypipe-status.XXXXXX" 2>/dev/null) || status=
+    # Detach completely (new session, no terminal), so closing the shell or
+    # terminal doesn't kill waypipe. setsid -f is util-linux; elsewhere (BSD,
+    # busybox without -f) fall back to nohup.
+    if ! SAYPIPE_STATUS=$status setsid -f "$0" --run "$@" </dev/null >/dev/null 2>&1; then
+        SAYPIPE_STATUS=$status nohup "$0" --run "$@" </dev/null >/dev/null 2>&1 &
+    fi
+    [ -n "$status" ] || return 0
+    sleep "$step" 2>/dev/null || step=1               # no fractional sleep: whole seconds
+    max=$(awk -v w="${SAYPIPE_WAIT:-2}" -v s="$step" 'BEGIN { printf "%d", w / s }')
+    while [ $n -lt "$max" ] && [ ! -s "$status" ]; do sleep "$step"; n=$((n + 1)); done
+    rc=0
+    if [ -s "$status" ]; then
+        # The app ended while we were watching: any error exit this early
+        # means it didn't start (e.g. the command doesn't exist there).
+        rc=$(head -n 1 "$status")
+        if [ "$rc" != 0 ]; then
+            {
+                printf '%s: %s on %s failed (exit %s):\n' "$SELF" "${*:2}" "$h" "$rc"
+                tail -n +2 "$status" | sed 's/^/  /'
+            } >&2
+        fi
+    fi
+    rm -f -- "$status"
+    return "$rc"
+}
 
 if [ -z "$host" ]; then
-    [ $# -gt 0 ] || { usage; exit 1; }
+    [ "${1:-}" = -- ] && shift
+    [ $# -gt 0 ] || usage_error "no host given (usage: $SELF [--] <host> [<command...>])"
     host=$1; shift
+    check_host "$host" || exit 2
 fi
-[ $# -gt 0 ] || { echo "$SELF: no command given for $host" >&2; usage; exit 1; }
-
-# Detach completely (new session, no terminal), so closing the shell or
-# terminal doesn't kill waypipe. The child re-runs this script in --run mode.
-# setsid -f is util-linux; elsewhere (BSD, busybox without -f) fall back to nohup.
-if ! setsid -f "$0" --run "$host" "$@" </dev/null >/dev/null 2>&1; then
-    nohup "$0" --run "$host" "$@" </dev/null >/dev/null 2>&1 &
+[ "${1:-}" = -- ] && shift
+# An alias (from a link or the command line) stands for its real host.
+if t=$(alias_target "$host"); then host=$t; fi
+# No command: run the host's default, else the global default.
+if [ $# -eq 0 ]; then
+    if c=$(default_cmd "$host") || c=$(default_cmd '*'); then
+        set -- "$c"
+    else
+        echo "$SELF: no command given for $host (set a default with" \
+             "'$SELF --default-set $host <command>' or '$SELF --default-set --global <command>')" >&2
+        exit 1
+    fi
 fi
-exit 0
+launch "$host" "$@"
+exit $?

@@ -1,0 +1,91 @@
+#compdef saypipe
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Everett C. Haimes III
+# zsh completion for saypipe. Candidates come from `saypipe --complete <kind>`.
+
+# __saypipe_add <kind> <description>: offer saypipe's candidates of that kind.
+__saypipe_add() {
+    local -a items
+    items=(${(f)"$(_call_program saypipe-$1 ${words[1]} --complete $1 2>/dev/null)"})
+    items=(${items:#})                     # drop empty lines
+    (( ${#items} )) && _wanted saypipe-$1 expl "$2" compadd -a items
+}
+
+# __saypipe_hosts: hosts, enabled ones (and aliases, links) in their own
+# group listed before the other ssh config hosts.
+__saypipe_hosts() {
+    local -a enabled other
+    enabled=(${(f)"$(_call_program saypipe-hosts ${words[1]} --complete enabled 2>/dev/null)"})
+    other=(${(f)"$(_call_program saypipe-hosts ${words[1]} --complete other 2>/dev/null)"})
+    enabled=(${enabled:#}) other=(${other:#})
+    (( ${#enabled} )) && compadd -J saypipe-enabled -X '%Benabled hosts%b' -a enabled
+    (( ${#other} )) && compadd -J saypipe-other -X '%Bother hosts%b' -a other
+}
+
+# __saypipe_flag <flag>...: offer flags not already on the line.
+__saypipe_flag() {
+    local f
+    for f; do (( ${words[(I)$f]} )) || compadd -- $f; done
+}
+
+_saypipe() {
+    local -a opts rest
+    opts=(
+        '--host-add:enable hosts (checks for waypipe)'
+        '--host-remove:remove hosts with their options'
+        '--list:enabled hosts with their options, or one list'
+        '--probe:test what hosts support'
+        '--gpu-add:let hosts use GPU buffers'
+        '--gpu-remove:back to -n for hosts'
+        '--audio-add:play hosts'\'' app audio here'
+        '--audio-remove:stop forwarding audio'
+        '--share-add:share one ssh connection per host'
+        '--share-remove:stop sharing connections'
+        '--share-exit:close shared connections'
+        '--default-set:set a host'\''s (or the global) default command'
+        '--default-remove:remove default commands'
+        '--alias-add:add an alias for a host'
+        '--alias-remove:remove aliases and their links'
+        '--link-add:make hosts commands'
+        '--link-remove:remove host links'
+        '--completion-hosts:complete all hosts or only enabled ones'
+        '--help:show usage'
+    )
+
+    if (( CURRENT == 2 )); then
+        if [[ $PREFIX == -* ]]; then
+            _describe -t options 'saypipe option' opts
+        else
+            __saypipe_hosts
+        fi
+        return
+    fi
+
+    # arguments so far, without flags
+    rest=(${words[3,CURRENT-1]:#--(force|global|apply)})
+    case $words[2] in
+        --host-add|--gpu-add|--audio-add|--share-add|--link-add)
+            __saypipe_flag --force; __saypipe_hosts ;;
+        --probe)          __saypipe_flag --apply; __saypipe_hosts ;;
+        --host-remove)    __saypipe_add enabled-hosts 'enabled host' ;;
+        --gpu-remove)     __saypipe_add gpu 'GPU-enabled host' ;;
+        --audio-remove)   __saypipe_add audio 'audio-enabled host' ;;
+        --share-remove|--share-exit) __saypipe_add share 'shared host' ;;
+        --link-remove)    __saypipe_add links 'host link' ;;
+        --alias-remove)   __saypipe_add aliases alias ;;
+        --alias-add)
+            __saypipe_flag --force
+            (( ${#rest} == 1 )) && __saypipe_hosts ;;
+        --default-set)
+            if (( ${#rest} == 0 )) && ! (( ${words[(I)--global]} )); then
+                __saypipe_flag --global --force; __saypipe_hosts
+            fi ;;
+        --default-remove)
+            if (( CURRENT == 3 )); then __saypipe_flag --global; fi
+            (( ${words[(I)--global]} )) || __saypipe_add defaults 'host with a default' ;;
+        --list)           (( CURRENT == 3 )) && __saypipe_add lists list ;;
+        --completion-hosts) (( CURRENT == 3 )) && compadd -- all enabled ;;
+    esac
+}
+
+_saypipe "$@"
