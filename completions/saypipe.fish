@@ -27,7 +27,7 @@ end
 complete -c saypipe -f
 
 # First argument: a host or an option.
-complete -c saypipe -n __saypipe_first -a '(__saypipe_list hosts)' -d host
+complete -c saypipe -n __saypipe_first -k -a '(__saypipe_list hosts)' -d host
 complete -c saypipe -n __saypipe_first -l link -d 'create host links'
 complete -c saypipe -n __saypipe_first -l unlink -d 'remove host links'
 complete -c saypipe -n __saypipe_first -l alias -d 'link an alias to a host'
@@ -52,7 +52,7 @@ complete -c saypipe -n __saypipe_first -l global-default-remove -d 'remove the g
 complete -c saypipe -n __saypipe_first -s h -l help -d 'show usage'
 
 # Arguments of the management options.
-complete -c saypipe -n '__saypipe_after --link --gpu-add --audio-add --share-add --probe' -a '(__saypipe_list hosts)' -d host
+complete -c saypipe -n '__saypipe_after --link --gpu-add --audio-add --share-add --probe' -k -a '(__saypipe_list hosts)' -d host
 complete -c saypipe -n '__saypipe_after --probe' -l apply -d 'enable supported features'
 complete -c saypipe -n '__saypipe_after --unlink' -a '(__saypipe_list links)' -d 'host link'
 complete -c saypipe -n '__saypipe_after --gpu-remove' -a '(__saypipe_list gpu)' -d 'GPU-enabled host'
@@ -60,5 +60,5 @@ complete -c saypipe -n '__saypipe_after --audio-remove' -a '(__saypipe_list audi
 complete -c saypipe -n '__saypipe_after --share-remove --share-exit' -a '(__saypipe_list share)' -d 'shared host'
 complete -c saypipe -n '__saypipe_after --unalias' -a '(__saypipe_list aliases)' -d alias
 complete -c saypipe -n '__saypipe_after --default-remove' -a '(__saypipe_list defaults)' -d 'host with a default'
-complete -c saypipe -n '__saypipe_at 2 --default-set' -a '(__saypipe_list hosts)' -d host
-complete -c saypipe -n '__saypipe_at 3 --alias' -a '(__saypipe_list hosts)' -d host
+complete -c saypipe -n '__saypipe_at 2 --default-set' -k -a '(__saypipe_list hosts)' -d host
+complete -c saypipe -n '__saypipe_at 3 --alias' -k -a '(__saypipe_list hosts)' -d host

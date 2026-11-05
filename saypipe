@@ -660,15 +660,20 @@ ssh_config_hosts() {
 complete_list() {
     local f n
     case $1 in
-        hosts)
+        hosts)                    # configured hosts first, then the rest
+            complete_list configured
+            complete_list other ;;
+        configured)               # hosts saypipe has settings or links for, and aliases
             {
-                ssh_config_hosts
-                ssh_config_hosts /etc/ssh/ssh_config
                 list_entries gpu; list_entries audio; list_entries share
                 alias_names
                 default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done
                 complete_list links
             } | sort -u ;;
+        other)                    # ssh config hosts that aren't configured
+            awk 'NR == FNR { seen[$0] = 1; next } !seen[$0]' \
+                <(complete_list configured) \
+                <({ ssh_config_hosts; ssh_config_hosts /etc/ssh/ssh_config; } | sort -u) ;;
         gpu|audio|share) list_entries "$1" ;;
         aliases)  alias_names ;;
         defaults) default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done ;;

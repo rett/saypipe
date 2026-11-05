@@ -38,7 +38,9 @@ emerge or FreeBSD `pkg` through sudo or doas. Uninstalling keeps packages.
 `install.sh` installs completions for bash (with bash-completion), zsh and
 fish: options, hosts (from your ssh config, including `Include` files, and
 saypipe's own lists) and, after options like `--gpu-remove` or `--unalias`,
-only the hosts or aliases that apply. System-wide installs use
+only the hosts or aliases that apply. Hosts saypipe has settings, links or
+aliases for are listed first (zsh shows them as their own group), then the
+rest of your ssh config. System-wide installs use
 `/usr/local/share` (fish falls back to `/etc/fish/completions` where it
 doesn't search there); `--user` installs link them into your own completion
 directories. For zsh with `--user`, add
