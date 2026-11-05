@@ -45,6 +45,7 @@ GPU_HOSTS_FILE="$CONFIG_DIR/gpu-hosts"
 AUDIO_HOSTS_FILE="$CONFIG_DIR/audio-hosts"
 SHARE_HOSTS_FILE="$CONFIG_DIR/share-hosts"
 ALIASES_FILE="$CONFIG_DIR/aliases"
+COMMANDS_FILE="$CONFIG_DIR/commands"
 SHARE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/saypipe-$(id -u)}/saypipe/cm"
 ERROR_LOG="$STATE_DIR/errors.log"
 
@@ -127,6 +128,23 @@ alias_names() {
 # real_host <name>: the host behind an alias, or <name> itself.
 real_host() { alias_target "$1" || printf '%s\n' "$1"; }
 
+# default_cmd <host>: the command <host> runs when none is given
+# (COMMANDS_FILE holds "<host> <command...>" lines; a "user@host" target
+# matches a "host" line). Fails if there is none. Commands may contain '#',
+# so only whole-line comments count.
+default_cmd() {
+    local l k rest
+    [ -r "$COMMANDS_FILE" ] || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k rest <<< "$l"
+        case ${k:-} in ""|"#"*) continue ;; esac
+        if { [ "$k" = "$1" ] || [ "$k" = "${1##*@}" ]; } && [ -n "${rest:-}" ]; then
+            printf '%s\n' "$rest"; return 0
+        fi
+    done < "$COMMANDS_FILE"
+    return 1
+}
+
 # share_opts <host>: set SHARE_SSH to the ssh options for connection sharing
 # (one ControlMaster connection carrying every session to the host) if the
 # host is listed in share-hosts, else to nothing (ssh's own config applies).
@@ -193,8 +211,9 @@ wp_opts() {
 usage() {
     local LINK_DIR_HINT=${SAYPIPE_BIN_DIR:-~/.local/bin}
     cat >&2 <<EOF
-Usage: $SELF <host> <command...>
-       <link-to-$SELF> <command...>      (link name is used as the host)
+Usage: $SELF <host> [<command...>]
+       <link-to-$SELF> [<command...>]    (link name is used as the host)
+       Without a command, the host's default (--default-set) runs.
 
 Runs: waypipe -n -c zstd ssh <host> <command...>
       or, for hosts listed in $GPU_HOSTS_FILE:
@@ -210,6 +229,10 @@ Management (as $SELF only):
   $SELF --alias <alias> <host>  link <alias> to connect to <host> (e.g. when the
                                 host name clashes with a command)
   $SELF --unalias <alias>...    remove aliases and their links
+  $SELF --default-set <host> <command...>
+                                command <host> runs when given none
+  $SELF --default-remove <host>...
+  $SELF --default-list          list default commands
   $SELF --gpu-add <host>...     let <host> use GPU buffers (run without -n)
   $SELF --gpu-remove <host>...  back to -n for <host>
   $SELF --gpu-list              list GPU-enabled hosts
@@ -473,6 +496,66 @@ EOF
     case ":$PATH:" in *":$LINK_DIR:"*) ;; *) echo "note: $LINK_DIR is not in PATH" >&2 ;; esac
 }
 
+# default_drop <host>: remove <host>'s default command line from
+# COMMANDS_FILE (rewritten in place). Fails if it had none.
+default_drop() {
+    local l k rest tmp found=0
+    [ -r "$COMMANDS_FILE" ] || return 1
+    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-cmd.XXXXXX") || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k rest <<< "$l"
+        if [ "${k:-}" = "$1" ]; then found=1; else printf '%s\n' "$l"; fi
+    done < "$COMMANDS_FILE" > "$tmp"
+    [ $found -eq 0 ] || cat "$tmp" > "$COMMANDS_FILE"
+    rm -f -- "$tmp"
+    [ $found -eq 1 ]
+}
+
+# default_set <host> <command...>: the command <host> runs when none is given.
+default_set() {
+    local h=$1 c old; shift
+    valid_host "$h" || { die_soft "invalid host name: '$h'"; return; }
+    h=$(real_host "$h")                             # defaults follow the real host
+    c="$*"
+    case $c in *$'\n'*) die_soft "the command must be on one line"; return ;; esac
+    [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
+    old=$(default_cmd "$h") || old=
+    [ -z "$old" ] || default_drop "$h"
+    mkdir -p "${COMMANDS_FILE%/*}" || { die_soft "cannot create ${COMMANDS_FILE%/*}"; return; }
+    if [ ! -e "$COMMANDS_FILE" ]; then
+        cat > "$COMMANDS_FILE" <<'EOF'
+# saypipe default commands: "<host> <command...>" per line. Running a host
+# (or an alias for it) without a command runs this one. Only whole-line
+# comments: commands may contain '#'.
+EOF
+    fi
+    [ -s "$COMMANDS_FILE" ] && [ -n "$(tail -c 1 "$COMMANDS_FILE")" ] && echo >> "$COMMANDS_FILE"
+    printf '%s %s\n' "$h" "$c" >> "$COMMANDS_FILE" || { die_soft "cannot write $COMMANDS_FILE"; return; }
+    echo "$h: default command: $c${old:+ (was: $old)}"
+}
+
+# default_remove <host>...
+default_remove() {
+    local h
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        h=$(real_host "$h")
+        if default_drop "$h"; then echo "$h: default command removed"
+        else echo "$h: no default command"; fi
+    done
+}
+
+# default_list: "<host>  <command>" for every host with a default.
+default_list() {
+    local l k rest
+    [ -r "$COMMANDS_FILE" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r k rest <<< "$l"
+        case ${k:-} in ""|"#"*) continue ;; esac
+        [ -n "${rest:-}" ] && printf '%-20s %s\n' "$k" "$rest"
+    done < "$COMMANDS_FILE"
+}
+
 # alias_remove <alias>...: remove aliases and their links.
 alias_remove() {
     local a t did
@@ -496,8 +579,9 @@ list_all() {
         list_entries audio
         list_entries share
         alias_names
+        default_list | while read -r n _; do printf '%s\n' "$n"; done
     } | sort -u | while IFS= read -r n; do
-        notes=() t=$n shown=$n
+        notes=() t=$n shown=$n joined=
         if t=$(alias_target "$n"); then shown="$n -> $t"; else t=$n; fi
         is_gpu_host "$t" && notes+=(GPU)
         is_audio_host "$t" && notes+=(audio)
@@ -506,10 +590,12 @@ list_all() {
             if ssh "${SHARE_SSH[@]}" -O check "$t" >/dev/null 2>&1
             then notes+=("shared (connected)"); else notes+=(shared); fi
         fi
+        if c=$(default_cmd "$t"); then notes+=("runs: $c"); fi
         if [ ${#notes[@]} -eq 0 ]; then
             printf '%s\n' "$shown"
         else
-            printf '%-20s %s\n' "$shown" "$(IFS=,; echo "${notes[*]}" | sed 's/,/, /g')"
+            for c in "${notes[@]}"; do joined+="${joined:+, }$c"; done
+            printf '%-20s %s\n' "$shown" "$joined"
         fi
     done
 }
@@ -684,7 +770,7 @@ if [ -z "$host" ]; then
     mgmt_rc=0
     case "${1:-}" in
         --link|--unlink|--gpu-add|--gpu-remove|--audio-add|--audio-remove|\
-        --share-add|--share-remove|--share-exit|--unalias)
+        --share-add|--share-remove|--share-exit|--unalias|--default-remove)
             op=$1; shift
             [ $# -gt 0 ] || { echo "$SELF: $op needs at least one host" >&2; exit 2; }
             case $op in
@@ -698,6 +784,7 @@ if [ -z "$host" ]; then
                 --share-remove) list_remove share "$@" ;;
                 --share-exit)   share_exit "$@" ;;
                 --unalias)      alias_remove "$@" ;;
+                --default-remove) default_remove "$@" ;;
             esac
             exit $mgmt_rc ;;
         --alias)
@@ -706,6 +793,10 @@ if [ -z "$host" ]; then
         --gpu-list)   list_entries gpu; exit 0 ;;
         --audio-list) list_entries audio; exit 0 ;;
         --share-list) list_entries share; exit 0 ;;
+        --default-set)
+            [ $# -ge 3 ] || { echo "$SELF: usage: $SELF --default-set <host> <command...>" >&2; exit 2; }
+            shift; default_set "$@"; exit $mgmt_rc ;;
+        --default-list) default_list; exit 0 ;;
         --list)       list_all; exit 0 ;;
         --probe)      shift; probe "$@"; exit $mgmt_rc ;;
         --*)        [ "$1" = --help ] || { echo "$SELF: unknown option $1" >&2; usage; exit 2; } ;;
@@ -720,9 +811,18 @@ if [ -z "$host" ]; then
     [ $# -gt 0 ] || { usage; exit 1; }
     host=$1; shift
 fi
-[ $# -gt 0 ] || { echo "$SELF: no command given for $host" >&2; usage; exit 1; }
 # An alias (from a link or the command line) stands for its real host.
 if t=$(alias_target "$host"); then host=$t; fi
+# No command: run the host's default (--default-set), if it has one.
+if [ $# -eq 0 ]; then
+    if c=$(default_cmd "$host"); then
+        set -- "$c"
+    else
+        echo "$SELF: no command given for $host" \
+             "(set a default with '$SELF --default-set $host <command>')" >&2
+        exit 1
+    fi
+fi
 
 # Detach completely (new session, no terminal), so closing the shell or
 # terminal doesn't kill waypipe. The child re-runs this script in --run mode.

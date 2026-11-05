@@ -5,8 +5,8 @@ over ssh, with per-host defaults for GPU buffers, audio forwarding and ssh
 connection sharing.
 
 ```
-saypipe <host> <command...>       # e.g. saypipe myvm foot
-<host> <command...>               # via a host link: saypipe --link myvm; myvm foot
+saypipe <host> [<command...>]     # e.g. saypipe myvm foot
+<host> [<command...>]             # via a host link: saypipe --link myvm; myvm foot
 ```
 
 Each launch runs detached, so closing the terminal doesn't close the app.
@@ -115,6 +115,23 @@ GPU, audio and sharing settings belong to the real host, and `--gpu-add`,
 `--probe` and the like accept an alias in its place. `--list` shows aliases as
 `vm-dev -> dev`.
 
+## Default commands
+
+A host can have a command that runs when none is given:
+
+```
+saypipe --default-set myvm ghostty    # now `myvm` alone opens ghostty
+myvm                                  # same as: myvm ghostty
+myvm foot                             # an explicit command still wins
+saypipe --default-remove myvm
+saypipe --default-list
+```
+
+Defaults are stored in `~/.config/saypipe/commands` as `<host> <command...>`
+lines and belong to the real host, so its aliases use it too. Quote the
+command when it has shell syntax: `saypipe --default-set myvm "ghostty -e
+htop"`.
+
 ## Probing a host
 
 `saypipe --probe <host>...` tests what a host supports and shows what's
@@ -153,6 +170,10 @@ saypipe --link <host>...        create host links
 saypipe --unlink <host>...      remove host links (only ones pointing to saypipe)
 saypipe --alias <alias> <host>  link <alias> to connect to <host>
 saypipe --unalias <alias>...    remove aliases and their links
+saypipe --default-set <host> <command...>
+                                command the host runs when given none
+saypipe --default-remove <host>...
+saypipe --default-list          list default commands
 saypipe --gpu-add <host>...     host runs without -n
 saypipe --gpu-remove <host>...  host goes back to -n
 saypipe --gpu-list              list GPU-enabled hosts
@@ -179,6 +200,7 @@ Host links go in `$SAYPIPE_BIN_DIR` (default `~/.local/bin`). They point at
 - `~/.config/saypipe/audio-hosts`: audio opt-in, same format.
 - `~/.config/saypipe/share-hosts`: connection-sharing opt-in, same format.
 - `~/.config/saypipe/aliases`: `<alias> <host>` per line.
+- `~/.config/saypipe/commands`: `<host> <command...>` per line.
 - `$XDG_RUNTIME_DIR/saypipe/cm/`: control sockets of shared connections.
 - `~/.local/state/saypipe/errors.log`: failed launches.
 
