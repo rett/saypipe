@@ -1,0 +1,251 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Everett C. Haimes III
+# install.sh: install or uninstall saypipe.
+#
+#   ./install.sh                   install what saypipe needs (bash, an
+#                                  OpenSSH client, waypipe), then copy
+#                                  saypipe to $PREFIX/bin (default /usr/local/bin)
+#   ./install.sh --user            same, but link saypipe into ~/.local/bin
+#                                  (or $SAYPIPE_BIN_DIR) pointing at this
+#                                  checkout, so updating it updates saypipe
+#   ./install.sh [--user] --uninstall [--purge]
+#                                  remove saypipe and your host links to it;
+#                                  --purge also closes saypipe's shared ssh
+#                                  connections and deletes your saypipe config
+#                                  and state. Packages are kept.
+#
+# POSIX sh, so it runs before bash is installed. Package managers: apt, dnf,
+# yum, zypper, pacman, apk, xbps, emerge and FreeBSD pkg. Anything already on
+# PATH is left alone. Run as your normal user; sudo or doas is used for
+# packages and system-wide installs. Remote hosts need waypipe too (and, for
+# audio, a PulseAudio-compatible client stack such as PipeWire's
+# pipewire-pulse).
+
+set -eu
+
+SRC_DIR=$(cd -- "$(dirname -- "$0")" && pwd)
+SRC=$SRC_DIR/saypipe
+
+if [ -t 2 ]; then B='\033[1;34m' Y='\033[1;33m' R='\033[1;31m' N='\033[0m'
+else B='' Y='' R='' N=''; fi
+log()  { printf "${B}==>${N} %s\n" "$*"; }
+warn() { printf "${Y}WARNING:${N} %s\n" "$*" >&2; }
+die()  { printf "${R}ERROR:${N} %s\n" "$*" >&2; exit 1; }
+
+usage() { sed -n "/^# install.sh:/,/^$/s/^# \{0,1\}//p" "$0"; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then "$@"
+    elif have sudo; then sudo "$@"
+    elif have doas; then doas "$@"
+    else die "need root for: $* (run as root, or install sudo or doas)"
+    fi
+}
+
+# resolve <path>: absolute path with symlinks resolved, without relying on
+# GNU readlink -f. (POSIX sh has no local variables, hence the _r prefix.)
+resolve() {
+    _rp=$1 _rn=0
+    if readlink -f -- / >/dev/null 2>&1; then readlink -f -- "$_rp"; return; fi
+    if have realpath; then realpath -- "$_rp" 2>/dev/null && return; fi
+    while [ -L "$_rp" ] && [ $_rn -lt 40 ]; do
+        _rl=$(readlink -- "$_rp") || break
+        case $_rl in /*) _rp=$_rl ;; *) _rp=${_rp%/*}/$_rl ;; esac
+        _rn=$((_rn + 1))
+    done
+    _rd=$(cd -P -- "$(dirname -- "$_rp")" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "$_rd" "${_rp##*/}"
+}
+
+# is_saypipe <file>: a saypipe script (so we never overwrite or delete others)
+is_saypipe() { [ -f "$1" ] && grep -q '^# saypipe: run' "$1"; }
+
+# The user whose links and config we manage: the invoking user, even under
+# sudo/doas.
+user_home() {
+    _uh=$HOME
+    _uu=${SUDO_USER:-${DOAS_USER:-}}
+    if [ "$(id -u)" -eq 0 ] && [ -n "$_uu" ]; then
+        _h=$(getent passwd "$_uu" 2>/dev/null | cut -d: -f6 || true)
+        case $_uu in *[!A-Za-z0-9._-]*) ;; *) [ -n "$_h" ] || _h=$(eval "echo ~$_uu") ;; esac
+        [ -n "$_h" ] && _uh=$_h
+    fi
+    printf '%s\n' "$_uh"
+}
+
+detect_pm() {
+    if [ "$(uname -s)" = FreeBSD ] && have pkg; then echo pkg; return; fi
+    for pm in apt-get dnf yum zypper pacman apk xbps-install emerge; do
+        if have "$pm"; then echo "$pm"; return; fi
+    done
+    echo none
+}
+
+# pkg_name <pm> <need>: package providing a need ("-" = part of the base system)
+pkg_name() {
+    case $1:$2 in
+        apt-get:ssh|apk:ssh)              echo openssh-client ;;
+        dnf:ssh|yum:ssh|zypper:ssh)       echo openssh-clients ;;
+        pacman:ssh|xbps-install:ssh)      echo openssh ;;
+        emerge:ssh)                       echo net-misc/openssh ;;
+        pkg:ssh)                          echo - ;;
+        emerge:bash)                      echo app-shells/bash ;;
+        emerge:waypipe)                   echo gui-apps/waypipe ;;
+        *:*)                              echo "$2" ;;      # bash, waypipe
+    esac
+}
+
+install_packages() {
+    needs=''
+    have bash    || needs="$needs bash"
+    have ssh     || needs="$needs ssh"
+    have waypipe || needs="$needs waypipe"
+    if [ -z "$needs" ]; then
+        log "bash, ssh and waypipe are already installed"
+        return
+    fi
+    pm=$(detect_pm)
+    if [ "$pm" = none ]; then
+        warn "no supported package manager found; install these yourself:$needs"
+        return
+    fi
+    pkgs=''
+    for need in $needs; do
+        p=$(pkg_name "$pm" "$need")
+        [ "$p" = - ] || pkgs="$pkgs $p"
+    done
+    [ -n "$pkgs" ] || return 0
+    log "Installing with $pm:$pkgs"
+    # shellcheck disable=SC2086  # word splitting of $pkgs is intended
+    case $pm in
+        apt-get)      as_root apt-get update -q
+                      as_root env DEBIAN_FRONTEND=noninteractive \
+                          apt-get install -y --no-install-recommends $pkgs ;;
+        dnf|yum)      as_root "$pm" install -y $pkgs ;;
+        zypper)       as_root zypper --non-interactive install --no-recommends $pkgs ;;
+        pacman)       as_root pacman -S --needed --noconfirm $pkgs ;;
+        apk)          as_root apk add $pkgs ;;
+        xbps-install) as_root xbps-install -Sy $pkgs ;;
+        emerge)       as_root emerge --noreplace $pkgs ;;
+        pkg)          as_root pkg install -y $pkgs ;;
+    esac
+}
+
+# check_path: warn if the 'saypipe' found on PATH isn't the one installed.
+check_path() {
+    found=$(command -v saypipe || true)
+    if [ -z "$found" ] || [ "$(resolve "$found")" != "$(resolve "$DEST")" ]; then
+        warn "'saypipe' on your PATH is ${found:-missing}, not $DEST" \
+             "(another copy comes first, or ${DEST%/*} is not in PATH)"
+    fi
+}
+
+do_install() {
+    [ -f "$SRC" ] || die "saypipe not found next to install.sh ($SRC_DIR)"
+    install_packages
+    have bash || die "bash is required but still not installed"
+    have waypipe || warn "waypipe is not installed; saypipe needs it to launch apps"
+
+    if [ "$MODE" = user ]; then
+        target=$(resolve "$SRC")
+        mkdir -p "${DEST%/*}"
+        if [ -L "$DEST" ] && [ "$(resolve "$DEST")" = "$target" ]; then
+            log "Already linked: $DEST -> $target"
+        elif [ -e "$DEST" ] || [ -L "$DEST" ]; then
+            is_saypipe "$DEST" || die "$DEST exists and is not saypipe; not replacing it"
+            ln -sf -- "$target" "$DEST" && log "Linked $DEST -> $target (replaced the old one)"
+        else
+            ln -s -- "$target" "$DEST" && log "Linked $DEST -> $target"
+        fi
+    else
+        if [ -e "$DEST" ] && ! is_saypipe "$DEST"; then
+            die "$DEST exists and is not saypipe; not overwriting it"
+        fi
+        log "Installing $DEST"
+        as_root mkdir -p "${DEST%/*}"
+        as_root cp "$SRC" "$DEST.new.$$"
+        as_root chmod 0755 "$DEST.new.$$"
+        as_root mv -f "$DEST.new.$$" "$DEST"
+    fi
+    "$DEST" --help >/dev/null 2>&1 || die "$DEST does not run"
+    check_path
+    cat <<EOF
+
+Done. Next steps:
+  saypipe <host> <command>          launch an app, e.g. saypipe myvm foot
+  saypipe --link <host>             create a <host> shortcut in ~/.local/bin
+  saypipe --gpu-add <host>          GPU buffers for hosts with a usable GPU
+  saypipe --audio-add <host>        play the host's app audio here
+  saypipe --share-add <host>        share one ssh connection per host
+Remote hosts need waypipe installed.
+EOF
+}
+
+do_uninstall() {
+    home=$(user_home)
+    if [ "$MODE" = user ] && [ -L "$DEST" ] && [ ! -e "$DEST" ]; then
+        rm -f -- "$DEST" && log "Removed dangling link $DEST (its checkout is gone)"
+    elif [ -e "$DEST" ] || [ -L "$DEST" ]; then
+        is_saypipe "$DEST" || die "$DEST is not saypipe; not removing it"
+        target=$(resolve "$DEST")
+
+        if [ "$PURGE" = 1 ]; then
+            # Close saypipe's shared connections before their config goes.
+            for h in $(sed -e 's/#.*//' "${XDG_CONFIG_HOME:-$home/.config}/saypipe/share-hosts" 2>/dev/null); do
+                "$DEST" --share-exit "$h" || true
+            done
+        fi
+
+        # Host links to this saypipe would dangle: remove them first (in user
+        # mode they point through $DEST).
+        n=0
+        for f in "${SAYPIPE_BIN_DIR:-$home/.local/bin}"/*; do
+            [ "$f" != "$DEST" ] || continue
+            if [ -L "$f" ] && [ "$(resolve "$f")" = "$target" ]; then
+                rm -f -- "$f" && log "Removed host link ${f##*/}" && n=$((n + 1))
+            fi
+        done
+        [ $n -gt 0 ] || log "No host links to $DEST"
+
+        log "Removing $DEST"
+        if [ "$MODE" = user ]; then rm -f -- "$DEST"; else as_root rm -f -- "$DEST"; fi
+    else
+        log "saypipe is not installed at $DEST"
+    fi
+
+    cfg=${XDG_CONFIG_HOME:-$home/.config}/saypipe
+    state=${XDG_STATE_HOME:-$home/.local/state}/saypipe
+    if [ "$PURGE" = 1 ]; then
+        rm -rf -- "$cfg" "$state" && log "Deleted $cfg and $state"
+    else
+        echo
+        echo "Packages were kept (other software may use them), and so were $cfg"
+        echo "and $state. Use --uninstall --purge to delete those."
+    fi
+}
+
+MODE=system ACTION=install PURGE=0
+for arg in "$@"; do
+    case $arg in
+        --user)      MODE=user ;;
+        --uninstall) ACTION=uninstall ;;
+        --purge)     PURGE=1 ;;
+        -h|--help)   usage; exit 0 ;;
+        *)           usage >&2; die "unknown option: $arg" ;;
+    esac
+done
+[ "$PURGE" = 0 ] || [ "$ACTION" = uninstall ] || die "--purge only goes with --uninstall"
+
+if [ "$MODE" = user ]; then
+    DEST=${SAYPIPE_BIN_DIR:-$(user_home)/.local/bin}/saypipe
+else
+    DEST=${PREFIX:-/usr/local}/bin/saypipe
+fi
+
+case $ACTION in
+    install)   do_install ;;
+    uninstall) do_uninstall ;;
+esac

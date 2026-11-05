@@ -1,0 +1,461 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Everett C. Haimes III
+# saypipe: run `waypipe [-n] -c zstd ssh <host> <command...>`
+#
+#   CLI:       saypipe <host> <command...>
+#   Via link:  ln -s saypipe myserver; myserver <command...>   (name = host)
+#
+# Launches run detached, so closing the terminal doesn't close the app. Real
+# failures (ssh errors, command not found) are appended to
+# ~/.local/state/saypipe/errors.log.
+#
+# Waypipe options, per host:
+#   default      -n -c zstd   -n (--no-gpu) sends shm buffers, no dmabufs. Hosts
+#                             without a GPU need it: there waypipe-server aborts
+#                             with "Failed to create Vulkan instance".
+#   GPU opt-in   -c zstd      hosts listed in ~/.config/saypipe/gpu-hosts
+#                             (one per line, # comments). Lets GL apps share
+#                             dmabufs.
+#   -c zstd uses ~30% less bandwidth than the default lz4 at the same frame rate.
+#   SAYPIPE_OPTS="..." (word-split) replaces the options for every host.
+#
+# Audio opt-in: for hosts listed in ~/.config/saypipe/audio-hosts, the local
+# PulseAudio socket is forwarded over the same ssh connection (ssh -R to a
+# random /tmp/saypipe-pulse-*.sock on the remote) and the app is started as
+# `env PULSE_SERVER=unix:<that socket> <command...>`. The remote socket is
+# removed again after the session.
+#
+# Connection sharing opt-in: hosts listed in ~/.config/saypipe/share-hosts get
+# ssh -o ControlMaster=auto (control sockets in $XDG_RUNTIME_DIR/saypipe/cm,
+# kept for SAYPIPE_SHARE_PERSIST, default 10m), so every session to the host
+# reuses one connection.
+#
+# Host links (--link) go in $SAYPIPE_BIN_DIR, default ~/.local/bin. Install
+# and uninstall with install.sh.
+#
+# Needs bash (3.2 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
+
+set -u
+
+SELF=saypipe          # canonical name; any other name is treated as the host
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/saypipe"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/saypipe"
+GPU_HOSTS_FILE="$CONFIG_DIR/gpu-hosts"
+AUDIO_HOSTS_FILE="$CONFIG_DIR/audio-hosts"
+SHARE_HOSTS_FILE="$CONFIG_DIR/share-hosts"
+SHARE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/saypipe-$(id -u)}/saypipe/cm"
+ERROR_LOG="$STATE_DIR/errors.log"
+
+name=${0##*/}
+name=${name%.sh}
+host=
+[ "$name" != "$SELF" ] && host=$name
+
+# resolve <path>: absolute path with all symlinks resolved (readlink -f where
+# available, else realpath, else a manual walk).
+resolve() {
+    local p=$1 d l n=0
+    if readlink -f -- / >/dev/null 2>&1; then readlink -f -- "$p"; return; fi
+    if command -v realpath >/dev/null 2>&1; then realpath -- "$p" 2>/dev/null && return; fi
+    while [ -L "$p" ] && [ $n -lt 40 ]; do
+        l=$(readlink -- "$p") || break
+        case $l in /*) p=$l ;; *) p=${p%/*}/$l ;; esac
+        n=$((n + 1))
+    done
+    d=$(cd -P -- "$(dirname -- "$p")" 2>/dev/null && pwd -P) || return 1
+    printf '%s/%s\n' "$d" "${p##*/}"
+}
+
+# list_file <kind>: the host list file for "gpu", "audio" or "share".
+list_file() {
+    case $1 in
+        gpu)   printf '%s\n' "$GPU_HOSTS_FILE" ;;
+        audio) printf '%s\n' "$AUDIO_HOSTS_FILE" ;;
+        share) printf '%s\n' "$SHARE_HOSTS_FILE" ;;
+    esac
+}
+
+# list_entries <kind>: the host entries of that list, comments and blanks dropped.
+list_entries() {
+    local f l
+    f=$(list_file "$1")
+    [ -r "$f" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        l=${l%%#*}                                   # strip comments
+        l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
+        [ -n "$l" ] && printf '%s\n' "$l"
+    done < "$f"
+}
+
+# host_listed <kind> <host>: in that list? Matches the host as given or without
+# a user@ prefix (so "rett@myvm" matches a "myvm" line).
+host_listed() {
+    local h=$2 bare=${2##*@} l
+    while IFS= read -r l; do
+        [ "$l" = "$h" ] || [ "$l" = "$bare" ] && return 0
+    done < <(list_entries "$1")
+    return 1
+}
+is_gpu_host()   { host_listed gpu "$1"; }
+is_audio_host() { host_listed audio "$1"; }
+is_share_host() { host_listed share "$1"; }
+
+# share_opts <host>: set SHARE_SSH to the ssh options for connection sharing
+# (one ControlMaster connection carrying every session to the host) if the
+# host is listed in share-hosts, else to nothing (ssh's own config applies).
+# With <force> as $2, set them regardless (for --share-exit).
+SHARE_SSH=()
+share_opts() {
+    SHARE_SSH=()
+    is_share_host "$1" || [ -n "${2:-}" ] || return 0
+    mkdir -p "$SHARE_DIR" 2>/dev/null && chmod 700 "${SHARE_DIR%/cm}" "$SHARE_DIR" 2>/dev/null
+    SHARE_SSH=(-o ControlMaster=auto -o "ControlPath=$SHARE_DIR/%C"
+               -o "ControlPersist=${SAYPIPE_SHARE_PERSIST:-10m}"
+               -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
+}
+
+# audio_setup <host>: for an audio-enabled host, forward the local PulseAudio
+# socket to a random remote path over the same ssh connection and point the
+# remote app at it. Sets AUDIO_SSH (ssh options), AUDIO_ENV (command prefix)
+# and AUDIO_RSOCK (remote socket path, removed again after the session).
+AUDIO_SSH=(); AUDIO_ENV=(); AUDIO_RSOCK=; AUDIO_LSOCK=
+audio_setup() {
+    is_audio_host "$1" || return 0
+    AUDIO_LSOCK="${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse}/native"
+    if [ ! -S "$AUDIO_LSOCK" ]; then
+        echo "$SELF: audio: no PulseAudio socket at $AUDIO_LSOCK; continuing without audio" >&2
+        AUDIO_LSOCK=
+        return 0
+    fi
+    # Random name: sshd won't replace an existing socket (StreamLocalBindUnlink
+    # defaults to no), and concurrent sessions must not collide.
+    AUDIO_RSOCK=/tmp/saypipe-pulse-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').sock
+    AUDIO_SSH=(-o ExitOnForwardFailure=no -R "$AUDIO_RSOCK:$AUDIO_LSOCK")
+    AUDIO_ENV=(env "PULSE_SERVER=unix:$AUDIO_RSOCK")
+}
+
+# audio_cleanup <host>: undo the audio forward after the session. sshd leaves
+# the socket file behind, and with ssh connection sharing (ControlMaster) the
+# master also keeps the forward listening until it exits, so cancel it there.
+audio_cleanup() {
+    [ -n "$AUDIO_RSOCK" ] || return 0
+    if ssh "${SHARE_SSH[@]}" -O check "$1" >/dev/null 2>&1; then
+        ssh "${SHARE_SSH[@]}" -O cancel -R "$AUDIO_RSOCK:$AUDIO_LSOCK" "$1" >/dev/null 2>&1
+    fi
+    ssh "${SHARE_SSH[@]}" -o BatchMode=yes -o ConnectTimeout=5 "$1" \
+        rm -f -- "$AUDIO_RSOCK" >/dev/null 2>&1
+}
+
+# wp_opts <host>: set WP_OPTS to the waypipe options for that host.
+WP_OPTS=()
+wp_opts() {
+    if [ -n "${SAYPIPE_OPTS:-}" ]; then
+        read -r -a WP_OPTS <<< "$SAYPIPE_OPTS"
+    elif is_gpu_host "$1"; then
+        WP_OPTS=(-c zstd)
+    else
+        WP_OPTS=(-n -c zstd)
+    fi
+}
+
+usage() {
+    local LINK_DIR_HINT=${SAYPIPE_BIN_DIR:-~/.local/bin}
+    cat >&2 <<EOF
+Usage: $SELF <host> <command...>
+       <link-to-$SELF> <command...>      (link name is used as the host)
+
+Runs: waypipe -n -c zstd ssh <host> <command...>
+      or, for hosts listed in $GPU_HOSTS_FILE:
+      waypipe -c zstd ssh <host> <command...>
+      (SAYPIPE_OPTS replaces the waypipe options for every host)
+      Hosts listed in $AUDIO_HOSTS_FILE also get the local PulseAudio
+      socket forwarded (ssh -R) and PULSE_SERVER set for the app.
+      Launches run detached; real failures go to $ERROR_LOG.
+
+Management (as $SELF only):
+  $SELF --link <host>...        create <host> -> $SELF symlinks in $LINK_DIR_HINT
+  $SELF --unlink <host>...      remove such symlinks (only ones pointing here)
+  $SELF --gpu-add <host>...     let <host> use GPU buffers (run without -n)
+  $SELF --gpu-remove <host>...  back to -n for <host>
+  $SELF --gpu-list              list GPU-enabled hosts
+  $SELF --audio-add <host>...   play <host>'s app audio on this machine
+  $SELF --audio-remove <host>...
+  $SELF --audio-list            list audio-enabled hosts
+  $SELF --share-add <host>...   share one ssh connection for all <host> sessions
+  $SELF --share-remove <host>...
+  $SELF --share-list            list hosts with connection sharing
+  $SELF --share-exit <host>...  close the shared connection (closes its apps)
+  $SELF --list                  every known host, with GPU/audio/sharing notes
+EOF
+}
+
+# ---- worker -----------------------------------------------------------------
+
+# Internal: the detached worker. Runs waypipe and, on a real failure, appends
+# the tail of its output to ERROR_LOG (there is no terminal to show it on).
+if [ "${1:-}" = "--run" ]; then
+    host=$2; shift 2
+    log=$(mktemp "${TMPDIR:-/tmp}/saypipe.XXXXXX") || log=/dev/null
+    wp_opts "$host"
+    share_opts "$host"
+    audio_setup "$host" 2>>"$log"
+    waypipe "${WP_OPTS[@]}" ssh "${SHARE_SSH[@]}" "${AUDIO_SSH[@]}" "$host" \
+        "${AUDIO_ENV[@]}" "$@" </dev/null >>"$log" 2>&1
+    rc=$?
+    audio_cleanup "$host"
+    # Apps often exit non-zero when their window is closed (e.g. foot gives 1),
+    # so only record codes that mean a real failure: 255 = ssh error,
+    # 127/126 = command not found / not executable.
+    case $rc in
+        255|127|126)
+            if mkdir -p "$STATE_DIR" 2>/dev/null; then
+                {
+                    printf '[%s] waypipe %s ssh %s %s: exit %s\n' \
+                        "$(date '+%Y-%m-%d %H:%M:%S')" "${WP_OPTS[*]}" "$host" "$*" "$rc"
+                    tail -n 12 "$log" 2>/dev/null | sed 's/^/  /'
+                } >> "$ERROR_LOG"
+            fi ;;
+    esac
+    [ "$log" = /dev/null ] || rm -f "$log"
+    exit $rc
+fi
+
+# ---- management: --link/--unlink/--gpu-*/--audio-*/--share-*/--list ---------
+
+SCRIPT_PATH=$(resolve "$0")
+# Host links go where commands live, not next to the real script (which may be
+# a git checkout symlinked into PATH).
+LINK_DIR=${SAYPIPE_BIN_DIR:-$HOME/.local/bin}
+
+# link_target: what a new host link points at. "saypipe" (relative) when
+# LINK_DIR has a saypipe that is this script, else this script's full path.
+link_target() {
+    if [ -e "$LINK_DIR/$SELF" ] && [ "$(resolve "$LINK_DIR/$SELF")" = "$SCRIPT_PATH" ]; then
+        printf '%s\n' "$SELF"
+    else
+        printf '%s\n' "$SCRIPT_PATH"
+    fi
+}
+
+die_soft() { printf '%s: %s\n' "$SELF" "$*" >&2; mgmt_rc=1; }
+
+# Host names become file names and ssh targets: keep them boring.
+valid_host() {
+    case $1 in ""|-*|.|..|"$SELF") return 1 ;; esac
+    [[ $1 =~ ^[A-Za-z0-9._@-]+$ ]]
+}
+
+# is_our_link <path>: a symlink that resolves to this script.
+is_our_link() { [ -L "$1" ] && [ "$(resolve "$1")" = "$SCRIPT_PATH" ]; }
+
+# list_label <kind>: how messages name the feature.
+list_label() {
+    case $1 in gpu) echo GPU ;; audio) echo audio ;; share) echo "connection sharing" ;; esac
+}
+
+list_file_init() {
+    local f
+    f=$(list_file "$1")
+    [ -e "$f" ] && return 0
+    mkdir -p "${f%/*}" || return 1
+    case $1 in
+        gpu) cat > "$f" <<'EOF'
+# Hosts that saypipe runs WITHOUT -n (--no-gpu), letting apps share GPU
+# buffers (dmabufs). One host per line; blank lines and # comments are ignored.
+# A "user@host" target matches a plain "host" line.
+#
+# Only list hosts with a usable GPU (render node + Vulkan driver). Everything
+# else gets -n, which hosts without a GPU require.
+EOF
+        ;;
+        audio) cat > "$f" <<'EOF'
+# Hosts whose apps play sound here: saypipe forwards the local PulseAudio
+# socket over the ssh connection and sets PULSE_SERVER for the remote app.
+# One host per line; blank lines and # comments are ignored.
+# A "user@host" target matches a plain "host" line.
+#
+# The remote host needs a libpulse-based client stack (PipeWire's
+# pipewire-pulse or PulseAudio) and sshd with AllowStreamLocalForwarding.
+EOF
+        ;;
+        share) cat > "$f" <<'EOF'
+# Hosts whose saypipe sessions share one ssh connection (ControlMaster):
+# faster launches, and quick launches don't trip ssh rate limits such as
+# `ufw limit`. A dropped connection closes every app on that host at once.
+# One host per line; blank lines and # comments are ignored.
+# A "user@host" target matches a plain "host" line.
+EOF
+        ;;
+    esac
+}
+
+# list_add <kind> <host>...
+list_add() {
+    local kind=$1 label h f; shift
+    label=$(list_label "$kind")
+    list_file_init "$kind" || { die_soft "cannot create $(list_file "$kind")"; return; }
+    f=$(list_file "$kind")
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        if host_listed "$kind" "$h"; then echo "$h: $label already enabled"; continue; fi
+        # make sure the file ends with a newline before appending
+        [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && echo >> "$f"
+        printf '%s\n' "$h" >> "$f" || { die_soft "cannot write $f"; continue; }
+        case $kind in
+            gpu)   echo "$h: GPU enabled (runs without -n)" ;;
+            audio) echo "$h: audio enabled (sound plays on this machine)" ;;
+            share) echo "$h: connection sharing enabled (applies to new launches)" ;;
+        esac
+    done
+}
+
+# list_remove <kind> <host>...
+list_remove() {
+    local kind=$1 label h f tmp l s found; shift
+    label=$(list_label "$kind")
+    f=$(list_file "$kind")
+    [ -r "$f" ] || { for h; do echo "$h: $label not enabled"; done; return; }
+    for h; do
+        found=0
+        tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-list.XXXXXX") || { die_soft "cannot write $f"; return; }
+        while IFS= read -r l || [ -n "$l" ]; do
+            s=${l%%#*}; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
+            if [ "$s" = "$h" ]; then found=1; else printf '%s\n' "$l"; fi
+        done < "$f" > "$tmp"
+        if [ $found -eq 1 ]; then
+            # Rewrite in place: keeps the file's permissions and any symlink.
+            cat "$tmp" > "$f" || { rm -f -- "$tmp"; die_soft "cannot write $f"; continue; }
+            case $kind in
+                gpu)   echo "$h: GPU disabled (runs with -n)" ;;
+                audio) echo "$h: audio disabled" ;;
+                share) echo "$h: connection sharing disabled" \
+                            "(an open master stays until '$SELF --share-exit $h' or it times out)" ;;
+            esac
+        else
+            echo "$h: not listed"
+        fi
+        rm -f -- "$tmp"
+        host_listed "$kind" "$h" &&
+            die_soft "$h: $label still enabled via another entry (e.g. without user@)"
+    done
+}
+
+link_add() {
+    local h t tgt
+    mkdir -p -- "$LINK_DIR" || { die_soft "cannot create $LINK_DIR"; return; }
+    tgt=$(link_target)
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        t=$LINK_DIR/$h
+        if is_our_link "$t"; then echo "$h: link already exists"; continue; fi
+        if [ -e "$t" ] || [ -L "$t" ]; then
+            die_soft "$t exists and is not a $SELF link; not touching it"; continue
+        fi
+        if type -t -- "$h" >/dev/null 2>&1; then
+            die_soft "'$h' is already a command ($(type -t -- "$h"): $(command -v -- "$h")); a link would shadow it"
+            continue
+        fi
+        ln -s -- "$tgt" "$t" && echo "$h: linked ($t -> $tgt)"
+    done
+    case ":$PATH:" in *":$LINK_DIR:"*) ;; *) echo "note: $LINK_DIR is not in PATH" >&2 ;; esac
+}
+
+link_remove() {
+    local h t
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        t=$LINK_DIR/$h
+        if is_our_link "$t"; then rm -f -- "$t" && echo "$h: link removed"
+        elif [ -e "$t" ] || [ -L "$t" ]; then die_soft "$t is not a $SELF link; not touching it"
+        else echo "$h: no link"
+        fi
+    done
+}
+
+# list_all: every known host once (linked, GPU, audio or shared), sorted, with notes.
+list_all() {
+    local f n notes
+    {
+        for f in "$LINK_DIR"/*; do
+            [ "${f##*/}" != "$SELF" ] && is_our_link "$f" && printf '%s\n' "${f##*/}"
+        done
+        list_entries gpu
+        list_entries audio
+        list_entries share
+    } | sort -u | while IFS= read -r n; do
+        notes=()
+        is_gpu_host "$n" && notes+=(GPU)
+        is_audio_host "$n" && notes+=(audio)
+        if is_share_host "$n"; then
+            share_opts "$n"
+            if ssh "${SHARE_SSH[@]}" -O check "$n" >/dev/null 2>&1
+            then notes+=("shared (connected)"); else notes+=(shared); fi
+        fi
+        if [ ${#notes[@]} -eq 0 ]; then
+            printf '%s\n' "$n"
+        else
+            printf '%-20s %s\n' "$n" "$(IFS=,; echo "${notes[*]}" | sed 's/,/, /g')"
+        fi
+    done
+}
+
+# share_exit <host>...: close saypipe's shared connection to each host.
+share_exit() {
+    local h
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        share_opts "$h" force
+        if ssh "${SHARE_SSH[@]}" -O check "$h" >/dev/null 2>&1; then
+            ssh "${SHARE_SSH[@]}" -O exit "$h" >/dev/null 2>&1 &&
+                echo "$h: shared connection closed (its apps close with it)"
+        else
+            echo "$h: no shared connection open"
+        fi
+    done
+}
+
+if [ -z "$host" ]; then
+    mgmt_rc=0
+    case "${1:-}" in
+        --link|--unlink|--gpu-add|--gpu-remove|--audio-add|--audio-remove|\
+        --share-add|--share-remove|--share-exit)
+            op=$1; shift
+            [ $# -gt 0 ] || { echo "$SELF: $op needs at least one host" >&2; exit 2; }
+            case $op in
+                --link)         link_add "$@" ;;
+                --unlink)       link_remove "$@" ;;
+                --gpu-add)      list_add gpu "$@" ;;
+                --gpu-remove)   list_remove gpu "$@" ;;
+                --audio-add)    list_add audio "$@" ;;
+                --audio-remove) list_remove audio "$@" ;;
+                --share-add)    list_add share "$@" ;;
+                --share-remove) list_remove share "$@" ;;
+                --share-exit)   share_exit "$@" ;;
+            esac
+            exit $mgmt_rc ;;
+        --gpu-list)   list_entries gpu; exit 0 ;;
+        --audio-list) list_entries audio; exit 0 ;;
+        --share-list) list_entries share; exit 0 ;;
+        --list)       list_all; exit 0 ;;
+        --*)        [ "$1" = --help ] || { echo "$SELF: unknown option $1" >&2; usage; exit 2; } ;;
+    esac
+fi
+
+# ---- launch -----------------------------------------------------------------
+
+case "${1:-}" in -h|--help) usage; exit 0 ;; esac
+
+if [ -z "$host" ]; then
+    [ $# -gt 0 ] || { usage; exit 1; }
+    host=$1; shift
+fi
+[ $# -gt 0 ] || { echo "$SELF: no command given for $host" >&2; usage; exit 1; }
+
+# Detach completely (new session, no terminal), so closing the shell or
+# terminal doesn't kill waypipe. The child re-runs this script in --run mode.
+# setsid -f is util-linux; elsewhere (BSD, busybox without -f) fall back to nohup.
+if ! setsid -f "$0" --run "$host" "$@" </dev/null >/dev/null 2>&1; then
+    nohup "$0" --run "$host" "$@" </dev/null >/dev/null 2>&1 &
+fi
+exit 0
