@@ -98,6 +98,23 @@ Trade-off: a dropped connection closes every app on that host at once.
 Hosts not listed use whatever your ssh config says, so sharing configured
 there still works.
 
+## Host links and aliases
+
+`saypipe --link myvm` creates a `myvm` command, so `myvm foot` works like
+`saypipe myvm foot`. When a host's name clashes with an existing command (or
+you'd just rather type something else), give it an alias:
+
+```
+saypipe --alias vm-dev dev       # `vm-dev foot` connects to host "dev"
+saypipe vm-dev foot              # aliases work on the command line too
+saypipe --unalias vm-dev         # remove the alias and its link
+```
+
+Aliases are stored in `~/.config/saypipe/aliases` as `<alias> <host>` lines.
+GPU, audio and sharing settings belong to the real host, and `--gpu-add`,
+`--probe` and the like accept an alias in its place. `--list` shows aliases as
+`vm-dev -> dev`.
+
 ## Probing a host
 
 `saypipe --probe <host>...` tests what a host supports and shows what's
@@ -134,6 +151,8 @@ off; `--apply` doesn't remove anything.
 ```
 saypipe --link <host>...        create host links
 saypipe --unlink <host>...      remove host links (only ones pointing to saypipe)
+saypipe --alias <alias> <host>  link <alias> to connect to <host>
+saypipe --unalias <alias>...    remove aliases and their links
 saypipe --gpu-add <host>...     host runs without -n
 saypipe --gpu-remove <host>...  host goes back to -n
 saypipe --gpu-list              list GPU-enabled hosts
@@ -159,6 +178,7 @@ Host links go in `$SAYPIPE_BIN_DIR` (default `~/.local/bin`). They point at
 - `~/.config/saypipe/gpu-hosts`: GPU opt-in, one host per line, `#` comments.
 - `~/.config/saypipe/audio-hosts`: audio opt-in, same format.
 - `~/.config/saypipe/share-hosts`: connection-sharing opt-in, same format.
+- `~/.config/saypipe/aliases`: `<alias> <host>` per line.
 - `$XDG_RUNTIME_DIR/saypipe/cm/`: control sockets of shared connections.
 - `~/.local/state/saypipe/errors.log`: failed launches.
 

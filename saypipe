@@ -44,6 +44,7 @@ STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/saypipe"
 GPU_HOSTS_FILE="$CONFIG_DIR/gpu-hosts"
 AUDIO_HOSTS_FILE="$CONFIG_DIR/audio-hosts"
 SHARE_HOSTS_FILE="$CONFIG_DIR/share-hosts"
+ALIASES_FILE="$CONFIG_DIR/aliases"
 SHARE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/saypipe-$(id -u)}/saypipe/cm"
 ERROR_LOG="$STATE_DIR/errors.log"
 
@@ -100,6 +101,31 @@ host_listed() {
 is_gpu_host()   { host_listed gpu "$1"; }
 is_audio_host() { host_listed audio "$1"; }
 is_share_host() { host_listed share "$1"; }
+
+# alias_target <name>: the host an alias stands for (ALIASES_FILE holds
+# "<alias> <host>" lines), or failure if <name> isn't an alias.
+alias_target() {
+    local l a t rest
+    [ -r "$ALIASES_FILE" ] || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r a t rest <<< "${l%%#*}"
+        if [ "${a:-}" = "$1" ] && [ -n "${t:-}" ]; then printf '%s\n' "$t"; return 0; fi
+    done < "$ALIASES_FILE"
+    return 1
+}
+
+# alias_names: every alias in ALIASES_FILE.
+alias_names() {
+    local l a rest
+    [ -r "$ALIASES_FILE" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r a rest <<< "${l%%#*}"
+        [ -n "${a:-}" ] && printf '%s\n' "$a"
+    done < "$ALIASES_FILE"
+}
+
+# real_host <name>: the host behind an alias, or <name> itself.
+real_host() { alias_target "$1" || printf '%s\n' "$1"; }
 
 # share_opts <host>: set SHARE_SSH to the ssh options for connection sharing
 # (one ControlMaster connection carrying every session to the host) if the
@@ -181,6 +207,9 @@ Runs: waypipe -n -c zstd ssh <host> <command...>
 Management (as $SELF only):
   $SELF --link <host>...        create <host> -> $SELF symlinks in $LINK_DIR_HINT
   $SELF --unlink <host>...      remove such symlinks (only ones pointing here)
+  $SELF --alias <alias> <host>  link <alias> to connect to <host> (e.g. when the
+                                host name clashes with a command)
+  $SELF --unalias <alias>...    remove aliases and their links
   $SELF --gpu-add <host>...     let <host> use GPU buffers (run without -n)
   $SELF --gpu-remove <host>...  back to -n for <host>
   $SELF --gpu-list              list GPU-enabled hosts
@@ -306,6 +335,7 @@ list_add() {
     f=$(list_file "$kind")
     for h; do
         if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        h=$(real_host "$h")                         # settings follow the real host
         if host_listed "$kind" "$h"; then echo "$h: $label already enabled"; continue; fi
         # make sure the file ends with a newline before appending
         [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && echo >> "$f"
@@ -325,6 +355,8 @@ list_remove() {
     f=$(list_file "$kind")
     [ -r "$f" ] || { for h; do echo "$h: $label not enabled"; done; return; }
     for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        h=$(real_host "$h")
         found=0
         tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-list.XXXXXX") || { die_soft "cannot write $f"; return; }
         while IFS= read -r l || [ -n "$l" ]; do
@@ -378,6 +410,78 @@ link_remove() {
         elif [ -e "$t" ] || [ -L "$t" ]; then die_soft "$t is not a $SELF link; not touching it"
         else echo "$h: no link"
         fi
+        alias_drop "$h" && echo "$h: alias removed"
+    done
+}
+
+# alias_drop <alias>: remove an alias's line from ALIASES_FILE (rewritten in
+# place, keeping permissions). Fails if there was no such alias.
+alias_drop() {
+    local l a rest tmp found=0
+    [ -r "$ALIASES_FILE" ] || return 1
+    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-alias.XXXXXX") || return 1
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r a rest <<< "${l%%#*}"
+        if [ "${a:-}" = "$1" ]; then found=1; else printf '%s\n' "$l"; fi
+    done < "$ALIASES_FILE" > "$tmp"
+    [ $found -eq 0 ] || cat "$tmp" > "$ALIASES_FILE"
+    rm -f -- "$tmp"
+    [ $found -eq 1 ]
+}
+
+# alias_add <alias> <host>: record that <alias> means <host> and create an
+# <alias> link, for when the host name clashes with a command or you'd rather
+# type something else.
+alias_add() {
+    local a=$1 h=$2 t=$LINK_DIR/$1 old
+    valid_host "$a" || { die_soft "invalid alias: '$a'"; return; }
+    valid_host "$h" || { die_soft "invalid host name: '$h'"; return; }
+    [ "$a" != "$h" ] || { die_soft "the alias is the host name; use '$SELF --link $h'"; return; }
+    if old=$(alias_target "$h"); then
+        die_soft "'$h' is itself an alias (for $old); give the real host"; return
+    fi
+    if ! is_our_link "$t"; then
+        if [ -e "$t" ] || [ -L "$t" ]; then
+            die_soft "$t exists and is not a $SELF link; pick another alias"; return
+        fi
+        if type -t -- "$a" >/dev/null 2>&1; then
+            die_soft "'$a' is already a command ($(type -t -- "$a"): $(command -v -- "$a")); pick another alias"
+            return
+        fi
+    fi
+    if old=$(alias_target "$a") && [ "$old" = "$h" ]; then
+        echo "$a: already an alias for $h"
+    else
+        [ -z "$old" ] || alias_drop "$a"
+        mkdir -p "${ALIASES_FILE%/*}" || { die_soft "cannot create ${ALIASES_FILE%/*}"; return; }
+        if [ ! -e "$ALIASES_FILE" ]; then
+            cat > "$ALIASES_FILE" <<'EOF'
+# saypipe host aliases: one "<alias> <host>" per line, # comments allowed.
+# `<alias> <command>` (a link made by `saypipe --alias`) and
+# `saypipe <alias> <command>` connect to <host>. GPU, audio and sharing
+# settings follow <host>.
+EOF
+        fi
+        [ -s "$ALIASES_FILE" ] && [ -n "$(tail -c 1 "$ALIASES_FILE")" ] && echo >> "$ALIASES_FILE"
+        printf '%s %s\n' "$a" "$h" >> "$ALIASES_FILE" || { die_soft "cannot write $ALIASES_FILE"; return; }
+        echo "$a: alias for $h${old:+ (was $old)}"
+    fi
+    if ! is_our_link "$t"; then
+        mkdir -p -- "$LINK_DIR" || { die_soft "cannot create $LINK_DIR"; return; }
+        ln -s -- "$(link_target)" "$t" && echo "$a: linked ($t)"
+    fi
+    case ":$PATH:" in *":$LINK_DIR:"*) ;; *) echo "note: $LINK_DIR is not in PATH" >&2 ;; esac
+}
+
+# alias_remove <alias>...: remove aliases and their links.
+alias_remove() {
+    local a t did
+    for a; do
+        if ! valid_host "$a"; then die_soft "invalid alias: '$a'"; continue; fi
+        did=0 t=$LINK_DIR/$a
+        if alias_drop "$a"; then echo "$a: alias removed"; did=1; fi
+        if is_our_link "$t"; then rm -f -- "$t" && echo "$a: link removed"; did=1; fi
+        [ $did -eq 1 ] || echo "$a: not an alias"
     done
 }
 
@@ -391,19 +495,21 @@ list_all() {
         list_entries gpu
         list_entries audio
         list_entries share
+        alias_names
     } | sort -u | while IFS= read -r n; do
-        notes=()
-        is_gpu_host "$n" && notes+=(GPU)
-        is_audio_host "$n" && notes+=(audio)
-        if is_share_host "$n"; then
-            share_opts "$n"
-            if ssh "${SHARE_SSH[@]}" -O check "$n" >/dev/null 2>&1
+        notes=() t=$n shown=$n
+        if t=$(alias_target "$n"); then shown="$n -> $t"; else t=$n; fi
+        is_gpu_host "$t" && notes+=(GPU)
+        is_audio_host "$t" && notes+=(audio)
+        if is_share_host "$t"; then
+            share_opts "$t"
+            if ssh "${SHARE_SSH[@]}" -O check "$t" >/dev/null 2>&1
             then notes+=("shared (connected)"); else notes+=(shared); fi
         fi
         if [ ${#notes[@]} -eq 0 ]; then
-            printf '%s\n' "$n"
+            printf '%s\n' "$shown"
         else
-            printf '%-20s %s\n' "$n" "$(IFS=,; echo "${notes[*]}" | sed 's/,/, /g')"
+            printf '%-20s %s\n' "$shown" "$(IFS=,; echo "${notes[*]}" | sed 's/,/, /g')"
         fi
     done
 }
@@ -413,6 +519,7 @@ share_exit() {
     local h
     for h; do
         if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        h=$(real_host "$h")
         share_opts "$h" force
         if ssh "${SHARE_SSH[@]}" -O check "$h" >/dev/null 2>&1; then
             ssh "${SHARE_SSH[@]}" -O exit "$h" >/dev/null 2>&1 &&
@@ -568,6 +675,7 @@ probe() {
     [ ${#hosts[@]} -gt 0 ] || { echo "$SELF: --probe needs at least one host" >&2; exit 2; }
     for h in "${hosts[@]}"; do
         if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        if t=$(alias_target "$h"); then echo "($h is an alias for $t)"; h=$t; fi
         probe_host "$h" "$apply"
     done
 }
@@ -576,7 +684,7 @@ if [ -z "$host" ]; then
     mgmt_rc=0
     case "${1:-}" in
         --link|--unlink|--gpu-add|--gpu-remove|--audio-add|--audio-remove|\
-        --share-add|--share-remove|--share-exit)
+        --share-add|--share-remove|--share-exit|--unalias)
             op=$1; shift
             [ $# -gt 0 ] || { echo "$SELF: $op needs at least one host" >&2; exit 2; }
             case $op in
@@ -589,8 +697,12 @@ if [ -z "$host" ]; then
                 --share-add)    list_add share "$@" ;;
                 --share-remove) list_remove share "$@" ;;
                 --share-exit)   share_exit "$@" ;;
+                --unalias)      alias_remove "$@" ;;
             esac
             exit $mgmt_rc ;;
+        --alias)
+            [ $# -eq 3 ] || { echo "$SELF: usage: $SELF --alias <alias> <host>" >&2; exit 2; }
+            alias_add "$2" "$3"; exit $mgmt_rc ;;
         --gpu-list)   list_entries gpu; exit 0 ;;
         --audio-list) list_entries audio; exit 0 ;;
         --share-list) list_entries share; exit 0 ;;
@@ -609,6 +721,8 @@ if [ -z "$host" ]; then
     host=$1; shift
 fi
 [ $# -gt 0 ] || { echo "$SELF: no command given for $host" >&2; usage; exit 1; }
+# An alias (from a link or the command line) stands for its real host.
+if t=$(alias_target "$host"); then host=$t; fi
 
 # Detach completely (new session, no terminal), so closing the shell or
 # terminal doesn't kill waypipe. The child re-runs this script in --run mode.
