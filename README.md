@@ -33,6 +33,18 @@ what's missing from your PATH, using apt, dnf, yum, zypper, pacman, apk, xbps,
 emerge or FreeBSD `pkg` through sudo or doas. Uninstalling keeps packages.
 `PREFIX` changes `/usr/local`; `SAYPIPE_BIN_DIR` changes `~/.local/bin`.
 
+### Shell completion
+
+`install.sh` installs completions for bash (with bash-completion), zsh and
+fish: options, hosts (from your ssh config, including `Include` files, and
+saypipe's own lists) and, after options like `--gpu-remove` or `--unalias`,
+only the hosts or aliases that apply. System-wide installs use
+`/usr/local/share` (fish falls back to `/etc/fish/completions` where it
+doesn't search there); `--user` installs link them into your own completion
+directories. For zsh with `--user`, add
+`fpath=(~/.local/share/zsh/site-functions $fpath)` to `~/.zshrc` before
+`compinit` if completion doesn't load.
+
 ### Newer waypipe (optional)
 
 saypipe works with your distribution's waypipe. If that one is too old (common

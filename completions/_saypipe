@@ -1,0 +1,64 @@
+#compdef saypipe
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Everett C. Haimes III
+# zsh completion for saypipe. Candidates come from `saypipe --complete <kind>`.
+
+# __saypipe_add <kind> <description>: offer saypipe's candidates of that kind.
+__saypipe_add() {
+    local -a items
+    items=(${(f)"$(_call_program saypipe-$1 ${words[1]} --complete $1 2>/dev/null)"})
+    items=(${items:#})                     # drop empty lines
+    (( ${#items} )) && _wanted saypipe-$1 expl "$2" compadd -a items
+}
+
+_saypipe() {
+    local -a opts
+    opts=(
+        '--link:create host links'
+        '--unlink:remove host links'
+        '--alias:link an alias to a host'
+        '--unalias:remove aliases and their links'
+        '--gpu-add:let hosts use GPU buffers'
+        '--gpu-remove:back to -n for hosts'
+        '--gpu-list:list GPU-enabled hosts'
+        '--audio-add:play hosts'\'' app audio here'
+        '--audio-remove:stop forwarding audio'
+        '--audio-list:list audio-enabled hosts'
+        '--share-add:share one ssh connection per host'
+        '--share-remove:stop sharing connections'
+        '--share-list:list hosts with connection sharing'
+        '--share-exit:close shared connections'
+        '--list:list every known host'
+        '--probe:test what hosts support'
+        '--default-set:set a host'\''s default command'
+        '--default-remove:remove default commands'
+        '--default-list:list default commands'
+        '--global-default:set the default for host links'
+        '--global-default-remove:remove the global default'
+        '--help:show usage'
+    )
+
+    if (( CURRENT == 2 )); then
+        if [[ $PREFIX == -* ]]; then
+            _describe -t options 'saypipe option' opts
+        else
+            __saypipe_add hosts host
+        fi
+        return
+    fi
+
+    case $words[2] in
+        --link|--gpu-add|--audio-add|--share-add) __saypipe_add hosts host ;;
+        --probe)          compadd -- --apply; __saypipe_add hosts host ;;
+        --unlink)         __saypipe_add links 'host link' ;;
+        --gpu-remove)     __saypipe_add gpu 'GPU-enabled host' ;;
+        --audio-remove)   __saypipe_add audio 'audio-enabled host' ;;
+        --share-remove|--share-exit) __saypipe_add share 'shared host' ;;
+        --unalias)        __saypipe_add aliases alias ;;
+        --default-remove) __saypipe_add defaults 'host with a default' ;;
+        --default-set)    (( CURRENT == 3 )) && __saypipe_add hosts host ;;
+        --alias)          (( CURRENT == 4 )) && __saypipe_add hosts host ;;
+    esac
+}
+
+_saypipe "$@"

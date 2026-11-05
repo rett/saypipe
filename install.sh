@@ -6,11 +6,16 @@
 #   ./install.sh                   install what saypipe needs (bash, an
 #                                  OpenSSH client, waypipe), then copy
 #                                  saypipe to $PREFIX/bin (default /usr/local/bin)
+#                                  and its bash/zsh/fish completions to
+#                                  $PREFIX/share
 #   ./install.sh --user            same, but link saypipe into ~/.local/bin
-#                                  (or $SAYPIPE_BIN_DIR) pointing at this
-#                                  checkout, so updating it updates saypipe
+#                                  (or $SAYPIPE_BIN_DIR) and the completions
+#                                  into your own completion directories,
+#                                  pointing at this checkout, so updating it
+#                                  updates saypipe
 #   ./install.sh [--user] --uninstall [--purge]
-#                                  remove saypipe and your host links to it;
+#                                  remove saypipe, its completions and your
+#                                  host links to it;
 #                                  --purge also closes saypipe's shared ssh
 #                                  connections and deletes your saypipe config
 #                                  and state. Packages are kept.
@@ -143,6 +148,75 @@ check_path() {
     fi
 }
 
+# completion_dests: "<file in completions/> <destination>" lines. System-wide
+# installs use the directories bash-completion, zsh and fish search under
+# /usr/local/share; per-user installs use the user's own directories.
+completion_dests() {
+    if [ "$MODE" = user ]; then
+        _ch=$(user_home)
+        _cd=${XDG_DATA_HOME:-$_ch/.local/share}
+        echo "saypipe.bash $_cd/bash-completion/completions/saypipe"
+        echo "_saypipe $_cd/zsh/site-functions/_saypipe"
+        echo "saypipe.fish ${XDG_CONFIG_HOME:-$_ch/.config}/fish/completions/saypipe.fish"
+    else
+        _cd=${PREFIX:-/usr/local}/share
+        echo "saypipe.bash $_cd/bash-completion/completions/saypipe"
+        echo "_saypipe $_cd/zsh/site-functions/_saypipe"
+        # Some fish builds (e.g. Debian's) don't search /usr/local/share;
+        # every fish searches /etc/fish/completions.
+        _cf=$_cd/fish/vendor_completions.d
+        if have fish && ! fish -c "contains -- $_cf \$fish_complete_path" >/dev/null 2>&1; then
+            _cf=/etc/fish/completions
+        fi
+        echo "saypipe.fish $_cf/saypipe.fish"
+    fi
+}
+
+# is_our_completion <file>: a saypipe completion script, or a dangling link
+# to one (so we never overwrite or delete anything else).
+is_our_completion() {
+    if [ -L "$1" ] && [ ! -e "$1" ]; then
+        case $(readlink -- "$1") in */completions/saypipe.bash|*/completions/_saypipe|*/completions/saypipe.fish) return 0 ;; esac
+        return 1
+    fi
+    [ -f "$1" ] && grep -q 'completion for saypipe' "$1"
+}
+
+install_completions() {
+    [ -d "$SRC_DIR/completions" ] || { warn "completions/ not found; skipping shell completion"; return 0; }
+    completion_dests | while read -r src dst; do
+        [ -f "$SRC_DIR/completions/$src" ] || continue
+        if { [ -e "$dst" ] || [ -L "$dst" ]; } && ! is_our_completion "$dst"; then
+            warn "$dst exists and is not saypipe's; not replacing it"; continue
+        fi
+        if [ "$MODE" = user ]; then
+            mkdir -p "${dst%/*}" && ln -sf -- "$(resolve "$SRC_DIR/completions/$src")" "$dst"
+        else
+            as_root mkdir -p "${dst%/*}" && as_root cp "$SRC_DIR/completions/$src" "$dst" &&
+                as_root chmod 0644 "$dst"
+        fi && log "Installed completion: $dst"
+    done
+    if [ "$MODE" = user ] && have zsh; then
+        echo "    zsh: if completion doesn't load, add this to ~/.zshrc before compinit:"
+        echo "      fpath=(${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions \$fpath)"
+    fi
+}
+
+uninstall_completions() {
+    {
+        completion_dests
+        # the fish location depends on the fish installed; check both
+        [ "$MODE" = user ] || printf '%s\n' \
+            "saypipe.fish ${PREFIX:-/usr/local}/share/fish/vendor_completions.d/saypipe.fish" \
+            "saypipe.fish /etc/fish/completions/saypipe.fish"
+    } | sort -u | while read -r src dst; do
+        if is_our_completion "$dst"; then
+            if [ "$MODE" = user ]; then rm -f -- "$dst"; else as_root rm -f -- "$dst"; fi &&
+                log "Removed completion: $dst"
+        fi
+    done
+}
+
 do_install() {
     [ -f "$SRC" ] || die "saypipe not found next to install.sh ($SRC_DIR)"
     install_packages
@@ -171,6 +245,7 @@ do_install() {
         as_root mv -f "$DEST.new.$$" "$DEST"
     fi
     "$DEST" --help >/dev/null 2>&1 || die "$DEST does not run"
+    install_completions
     check_path
     cat <<EOF
 
@@ -215,6 +290,7 @@ do_uninstall() {
     else
         log "saypipe is not installed at $DEST"
     fi
+    uninstall_completions
 
     cfg=${XDG_CONFIG_HOME:-$home/.config}/saypipe
     state=${XDG_STATE_HOME:-$home/.local/state}/saypipe

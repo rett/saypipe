@@ -631,6 +631,61 @@ list_all() {
     done
 }
 
+# ---- shell completion -------------------------------------------------------
+
+# ssh_config_hosts [file] [depth]: concrete Host names from the ssh config,
+# following Include (relative paths are under ~/.ssh). Patterns (*, ?, !)
+# are skipped.
+ssh_config_hosts() {
+    local f=${1:-$HOME/.ssh/config} depth=${2:-0} l key rest tok g toks
+    [ "$depth" -lt 8 ] && [ -r "$f" ] || return 0
+    while IFS= read -r l || [ -n "$l" ]; do
+        read -r key rest <<< "${l%%#*}"
+        if [[ ${key:-} == *=* ]]; then rest="${key#*=} ${rest:-}"; key=${key%%=*}; fi
+        read -ra toks <<< "${rest:-}"               # read -a doesn't glob
+        case ${key,,} in
+            host)
+                for tok in ${toks[@]+"${toks[@]}"}; do
+                    case $tok in *[\*\?\!]*) ;; *) printf '%s\n' "$tok" ;; esac
+                done ;;
+            include)
+                for tok in ${toks[@]+"${toks[@]}"}; do
+                    case $tok in "~/"*) tok=$HOME/${tok#\~/} ;; /*) ;; *) tok=$HOME/.ssh/$tok ;; esac
+                    for g in $tok; do ssh_config_hosts "$g" $((depth + 1)); done   # glob on purpose
+                done ;;
+        esac
+    done < "$f"
+}
+
+# complete_list <kind>: candidates for shell completion (completions/*).
+complete_list() {
+    local f n
+    case $1 in
+        hosts)
+            {
+                ssh_config_hosts
+                ssh_config_hosts /etc/ssh/ssh_config
+                list_entries gpu; list_entries audio; list_entries share
+                alias_names
+                default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done
+                complete_list links
+            } | sort -u ;;
+        gpu|audio|share) list_entries "$1" ;;
+        aliases)  alias_names ;;
+        defaults) default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done ;;
+        links)
+            for f in "$LINK_DIR"/*; do
+                [ "${f##*/}" != "$SELF" ] && is_our_link "$f" && printf '%s\n' "${f##*/}"
+            done ;;
+        options)
+            printf '%s\n' --link --unlink --alias --unalias --gpu-add --gpu-remove \
+                --gpu-list --audio-add --audio-remove --audio-list --share-add \
+                --share-remove --share-list --share-exit --list --probe --default-set \
+                --default-remove --default-list --global-default --global-default-remove --help ;;
+    esac
+    return 0
+}
+
 # share_exit <host>...: close saypipe's shared connection to each host.
 share_exit() {
     local h
@@ -836,6 +891,7 @@ if [ -z "$host" ]; then
             global_remove; exit $mgmt_rc ;;
         --list)       list_all; exit 0 ;;
         --probe)      shift; probe "$@"; exit $mgmt_rc ;;
+        --complete)   complete_list "${2:-}" 2>/dev/null; exit 0 ;;   # for completions/*
         --*)        [ "$1" = --help ] || { echo "$SELF: unknown option $1" >&2; usage; exit 2; } ;;
     esac
 fi
