@@ -52,7 +52,8 @@ ERROR_LOG="$STATE_DIR/errors.log"
 name=${0##*/}
 name=${name%.sh}
 host=
-[ "$name" != "$SELF" ] && host=$name
+via_link=0                    # started through a host link (or alias link)?
+[ "$name" != "$SELF" ] && { host=$name; via_link=1; }
 
 # resolve <path>: absolute path with all symlinks resolved (readlink -f where
 # available, else realpath, else a manual walk).
@@ -233,6 +234,10 @@ Management (as $SELF only):
                                 command <host> runs when given none
   $SELF --default-remove <host>...
   $SELF --default-list          list default commands
+  $SELF --global-default <command...>
+                                command host links run when their host has no
+                                default (not used for '$SELF <host>')
+  $SELF --global-default-remove
   $SELF --gpu-add <host>...     let <host> use GPU buffers (run without -n)
   $SELF --gpu-remove <host>...  back to -n for <host>
   $SELF --gpu-list              list GPU-enabled hosts
@@ -519,19 +524,27 @@ default_set() {
     c="$*"
     case $c in *$'\n'*) die_soft "the command must be on one line"; return ;; esac
     [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
+    default_write "$h" "$c" "$h"
+}
+
+# default_write <key> <command> <label>: store <command> for <key> (a host,
+# or "*" for the global default) in COMMANDS_FILE, replacing an old one.
+default_write() {
+    local h=$1 c=$2 label=$3 old
     old=$(default_cmd "$h") || old=
     [ -z "$old" ] || default_drop "$h"
     mkdir -p "${COMMANDS_FILE%/*}" || { die_soft "cannot create ${COMMANDS_FILE%/*}"; return; }
     if [ ! -e "$COMMANDS_FILE" ]; then
         cat > "$COMMANDS_FILE" <<'EOF'
 # saypipe default commands: "<host> <command...>" per line. Running a host
-# (or an alias for it) without a command runs this one. Only whole-line
-# comments: commands may contain '#'.
+# (or an alias for it) without a command runs this one. A "*" line is the
+# global default, used for hosts without one, but only when started through
+# a host link. Only whole-line comments: commands may contain '#'.
 EOF
     fi
     [ -s "$COMMANDS_FILE" ] && [ -n "$(tail -c 1 "$COMMANDS_FILE")" ] && echo >> "$COMMANDS_FILE"
     printf '%s %s\n' "$h" "$c" >> "$COMMANDS_FILE" || { die_soft "cannot write $COMMANDS_FILE"; return; }
-    echo "$h: default command: $c${old:+ (was: $old)}"
+    echo "$label: default command: $c${old:+ (was: $old)}"
 }
 
 # default_remove <host>...
@@ -545,6 +558,20 @@ default_remove() {
     done
 }
 
+# global_set <command...>: the command host links run when the host has no
+# default of its own.
+global_set() {
+    local c="$*"
+    case $c in *$'\n'*) die_soft "the command must be on one line"; return ;; esac
+    [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
+    default_write '*' "$c" "global (host links only)"
+}
+
+global_remove() {
+    if default_drop '*'; then echo "global default command removed"
+    else echo "no global default command"; fi
+}
+
 # default_list: "<host>  <command>" for every host with a default.
 default_list() {
     local l k rest
@@ -552,6 +579,7 @@ default_list() {
     while IFS= read -r l || [ -n "$l" ]; do
         read -r k rest <<< "$l"
         case ${k:-} in ""|"#"*) continue ;; esac
+        [ "$k" = '*' ] && k="* (global, links only)"
         [ -n "${rest:-}" ] && printf '%-20s %s\n' "$k" "$rest"
     done < "$COMMANDS_FILE"
 }
@@ -579,7 +607,7 @@ list_all() {
         list_entries audio
         list_entries share
         alias_names
-        default_list | while read -r n _; do printf '%s\n' "$n"; done
+        default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done
     } | sort -u | while IFS= read -r n; do
         notes=() t=$n shown=$n joined=
         if t=$(alias_target "$n"); then shown="$n -> $t"; else t=$n; fi
@@ -590,7 +618,10 @@ list_all() {
             if ssh "${SHARE_SSH[@]}" -O check "$t" >/dev/null 2>&1
             then notes+=("shared (connected)"); else notes+=(shared); fi
         fi
-        if c=$(default_cmd "$t"); then notes+=("runs: $c"); fi
+        if c=$(default_cmd "$t"); then notes+=("runs: $c")
+        elif is_our_link "$LINK_DIR/$n" && c=$(default_cmd '*'); then
+            notes+=("runs: $c (global default)")
+        fi
         if [ ${#notes[@]} -eq 0 ]; then
             printf '%s\n' "$shown"
         else
@@ -797,6 +828,12 @@ if [ -z "$host" ]; then
             [ $# -ge 3 ] || { echo "$SELF: usage: $SELF --default-set <host> <command...>" >&2; exit 2; }
             shift; default_set "$@"; exit $mgmt_rc ;;
         --default-list) default_list; exit 0 ;;
+        --global-default)
+            [ $# -ge 2 ] || { echo "$SELF: usage: $SELF --global-default <command...>" >&2; exit 2; }
+            shift; global_set "$@"; exit $mgmt_rc ;;
+        --global-default-remove)
+            [ $# -eq 1 ] || { echo "$SELF: --global-default-remove takes no arguments" >&2; exit 2; }
+            global_remove; exit $mgmt_rc ;;
         --list)       list_all; exit 0 ;;
         --probe)      shift; probe "$@"; exit $mgmt_rc ;;
         --*)        [ "$1" = --help ] || { echo "$SELF: unknown option $1" >&2; usage; exit 2; } ;;
@@ -813,13 +850,17 @@ if [ -z "$host" ]; then
 fi
 # An alias (from a link or the command line) stands for its real host.
 if t=$(alias_target "$host"); then host=$t; fi
-# No command: run the host's default (--default-set), if it has one.
+# No command: run the host's default (--default-set) or, when started through
+# a host link, the global default (--global-default).
 if [ $# -eq 0 ]; then
     if c=$(default_cmd "$host"); then
         set -- "$c"
+    elif [ "$via_link" = 1 ] && c=$(default_cmd '*'); then
+        set -- "$c"
     else
-        echo "$SELF: no command given for $host" \
-             "(set a default with '$SELF --default-set $host <command>')" >&2
+        hint="'$SELF --default-set $host <command>'"
+        [ "$via_link" = 0 ] || hint="$hint or '$SELF --global-default <command>'"
+        echo "$SELF: no command given for $host (set a default with $hint)" >&2
         exit 1
     fi
 fi

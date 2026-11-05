@@ -127,8 +127,18 @@ saypipe --default-remove myvm
 saypipe --default-list
 ```
 
+A global default covers hosts without their own, but only when started
+through a host link (or alias link); `saypipe <host>` with no command still
+needs a per-host default:
+
+```
+saypipe --global-default ghostty      # `anyhost` alone opens ghostty
+saypipe --global-default-remove
+```
+
 Defaults are stored in `~/.config/saypipe/commands` as `<host> <command...>`
-lines and belong to the real host, so its aliases use it too. Quote the
+lines (the global one as `* <command...>`) and belong to the real host, so its
+aliases use it too. Quote the
 command when it has shell syntax: `saypipe --default-set myvm "ghostty -e
 htop"`.
 
@@ -174,6 +184,9 @@ saypipe --default-set <host> <command...>
                                 command the host runs when given none
 saypipe --default-remove <host>...
 saypipe --default-list          list default commands
+saypipe --global-default <command...>
+                                command host links run when the host has none
+saypipe --global-default-remove
 saypipe --gpu-add <host>...     host runs without -n
 saypipe --gpu-remove <host>...  host goes back to -n
 saypipe --gpu-list              list GPU-enabled hosts
