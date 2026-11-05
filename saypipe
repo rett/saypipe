@@ -106,6 +106,100 @@ is_gpu_host()   { host_listed gpu "$1"; }
 is_audio_host() { host_listed audio "$1"; }
 is_share_host() { host_listed share "$1"; }
 
+# enabled_hosts: every enabled host: the host list plus hosts that have
+# options (GPU, audio, sharing, a default command), alias targets and links.
+enabled_hosts() {
+    local n f t
+    {
+        list_entries host; list_entries gpu; list_entries audio; list_entries share
+        default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done
+        while IFS= read -r n; do alias_target "$n"; done < <(alias_names)
+        for f in "$LINK_DIR"/*; do
+            n=${f##*/}
+            [ "$n" != "$SELF" ] && is_our_link "$f" || continue
+            if t=$(alias_target "$n"); then printf '%s\n' "$t"; else printf '%s\n' "$n"; fi
+        done
+    } | sort -u
+}
+
+# is_enabled <host>: enabled? ("user@host" matches "host")
+is_enabled() {
+    local l
+    while IFS= read -r l; do
+        [ "$l" = "$1" ] || [ "$l" = "${1##*@}" ] && return 0
+    done < <(enabled_hosts)
+    return 1
+}
+
+# waypipe_check <host>: reach <host> over ssh and check it has waypipe. Prints
+# the remote waypipe version, or why the check failed.
+waypipe_check() {
+    local out rc
+    share_opts "$1"
+    out=$(ssh "${SHARE_SSH[@]}" -o ConnectTimeout=10 "$1" sh -s 2>&1 <<'EOF'
+if command -v waypipe >/dev/null 2>&1; then waypipe --version 2>&1 | head -n 1
+else echo @@no-waypipe@@; fi
+EOF
+    ); rc=$?
+    if [ $rc -eq 255 ]; then printf 'cannot connect: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"; return 1; fi
+    case $out in
+        *@@no-waypipe@@*) echo "waypipe is not installed there"; return 1 ;;
+        "")               echo "no answer from the host"; return 1 ;;
+    esac
+    printf '%s\n' "$out" | tail -n 1
+}
+
+# ensure_enabled <host>: make sure <host> is enabled, checking first that it
+# has waypipe (unless FORCE=1). Fails, with a message, if it can't be.
+ensure_enabled() {
+    local h=$1 v
+    is_enabled "$h" && return 0
+    if [ "${FORCE:-0}" = 1 ]; then
+        list_add host "$h" >/dev/null && echo "$h: enabled (not checked: --force)"
+        return 0
+    fi
+    if v=$(waypipe_check "$h"); then
+        list_add host "$h" >/dev/null && echo "$h: enabled ($v)"
+    else
+        die_soft "$h: not enabled: $v; '$SELF --host-add --force $h' enables it anyway"
+        return 1
+    fi
+}
+
+# host_add <host>...: enable hosts (checked unless FORCE=1).
+host_add() {
+    local h
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        h=$(real_host "$h")
+        if is_enabled "$h"; then
+            list_add host "$h" >/dev/null            # record it on the host list
+            echo "$h: already enabled"
+        else
+            ensure_enabled "$h"
+        fi
+    done
+}
+
+# host_delete <host>...: remove hosts with all their options, aliases and links.
+host_delete() {
+    local h kind a found
+    for h; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        h=$(real_host "$h") found=0
+        for kind in host gpu audio share; do
+            if host_listed "$kind" "$h"; then list_remove "$kind" "$h" >/dev/null 2>&1; found=1; fi
+        done
+        if default_drop "$h"; then found=1; fi
+        while IFS= read -r a; do
+            [ "$(alias_target "$a")" = "$h" ] || continue
+            alias_remove "$a" >/dev/null && echo "$h: alias $a removed"; found=1
+        done < <(alias_names)
+        if is_our_link "$LINK_DIR/$h"; then rm -f -- "$LINK_DIR/$h" && echo "$h: link removed"; found=1; fi
+        if [ $found -eq 1 ]; then echo "$h: deleted (with its options)"; else echo "$h: not enabled"; fi
+    done
+}
+
 # setting_get <key> <default>: a value from SETTINGS_FILE ("<key> <value>"
 # lines, # comments), or <default>.
 setting_get() {
@@ -279,14 +373,16 @@ Management (as $SELF only):
   $SELF --share-add <host>...   share one ssh connection for all <host> sessions
   $SELF --share-remove <host>...
   $SELF --share-list            list hosts with connection sharing
-  $SELF --host-add <host>...    add hosts to the host list (no features enabled)
-  $SELF --host-remove <host>...
-  $SELF --host-list             list hosts on the host list
-  $SELF --completion-hosts [all|configured]
+  $SELF --host-add [--force] <host>...
+                                enable hosts once they're confirmed to have
+                                waypipe (--force skips the check)
+  $SELF --host-delete <host>... remove hosts with their options, aliases and links
+  $SELF --host-list             list enabled hosts
+  $SELF --completion-hosts [all|enabled]
                                 complete all ssh config hosts (default) or only
-                                hosts saypipe knows; no value shows the setting
+                                enabled ones; no value shows the setting
   $SELF --share-exit <host>...  close the shared connection (closes its apps)
-  $SELF --list                  every known host, with GPU/audio/sharing notes
+  $SELF --list                  enabled hosts with their options
   $SELF --probe <host>... [--apply]
                                 test which features <host> supports; --apply
                                 enables the supported ones
@@ -356,7 +452,7 @@ is_our_link() { [ -L "$1" ] && [ "$(resolve "$1")" = "$SCRIPT_PATH" ]; }
 list_label() {
     case $1 in
         gpu) echo GPU ;; audio) echo audio ;; share) echo "connection sharing" ;;
-        host) echo "on the host list" ;;
+        host) echo "enabled" ;;
     esac
 }
 
@@ -386,9 +482,10 @@ EOF
 EOF
         ;;
         host) cat > "$f" <<'EOF'
-# Hosts saypipe offers first when completing (and lists with --list), with
-# nothing else enabled for them. One host per line; blank lines and #
-# comments are ignored.
+# saypipe's enabled hosts, added with `saypipe --host-add` once they were
+# confirmed to have waypipe. Options (gpu-hosts, audio-hosts, share-hosts,
+# commands, aliases) apply to enabled hosts; hosts that have options count as
+# enabled too. One host per line; blank lines and # comments are ignored.
 EOF
         ;;
         share) cat > "$f" <<'EOF'
@@ -412,10 +509,12 @@ list_add() {
         if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
         h=$(real_host "$h")                         # settings follow the real host
         if host_listed "$kind" "$h"; then
-            if [ "$kind" = host ]; then echo "$h: already on the host list"
+            if [ "$kind" = host ]; then echo "$h: already enabled"
             else echo "$h: $label already enabled"; fi
             continue
         fi
+        # options belong to enabled hosts: enable (and check) the host first
+        [ "$kind" = host ] || ensure_enabled "$h" || continue
         # make sure the file ends with a newline before appending
         [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && echo >> "$f"
         printf '%s\n' "$h" >> "$f" || { die_soft "cannot write $f"; continue; }
@@ -423,7 +522,7 @@ list_add() {
             gpu)   echo "$h: GPU enabled (runs without -n)" ;;
             audio) echo "$h: audio enabled (sound plays on this machine)" ;;
             share) echo "$h: connection sharing enabled (applies to new launches)" ;;
-            host)  echo "$h: added to the host list" ;;
+            host)  echo "$h: enabled" ;;
         esac
     done
 }
@@ -470,6 +569,7 @@ link_add() {
         if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
         t=$LINK_DIR/$h
         if is_our_link "$t"; then echo "$h: link already exists"; continue; fi
+        alias_target "$h" >/dev/null || ensure_enabled "$h" || continue
         if [ -e "$t" ] || [ -L "$t" ]; then
             die_soft "$t exists and is not a $SELF link; not touching it"; continue
         fi
@@ -521,6 +621,7 @@ alias_add() {
     if old=$(alias_target "$h"); then
         die_soft "'$h' is itself an alias (for $old); give the real host"; return
     fi
+    ensure_enabled "$h" || return
     if ! is_our_link "$t"; then
         if [ -e "$t" ] || [ -L "$t" ]; then
             die_soft "$t exists and is not a $SELF link; pick another alias"; return
@@ -575,6 +676,8 @@ default_set() {
     valid_host "$h" || { die_soft "invalid host name: '$h'"; return; }
     h=$(real_host "$h")                             # defaults follow the real host
     c="$*"
+    [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
+    ensure_enabled "$h" || return
     case $c in *$'\n'*) die_soft "the command must be on one line"; return ;; esac
     [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
     default_write "$h" "$c" "$h"
@@ -653,15 +756,8 @@ alias_remove() {
 list_all() {
     local f n notes
     {
-        for f in "$LINK_DIR"/*; do
-            [ "${f##*/}" != "$SELF" ] && is_our_link "$f" && printf '%s\n' "${f##*/}"
-        done
-        list_entries gpu
-        list_entries audio
-        list_entries share
-        list_entries host
+        enabled_hosts
         alias_names
-        default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done
     } | sort -u | while IFS= read -r n; do
         notes=() t=$n shown=$n joined=
         if t=$(alias_target "$n"); then shown="$n -> $t"; else t=$n; fi
@@ -715,23 +811,18 @@ ssh_config_hosts() {
 complete_list() {
     local f n
     case $1 in
-        hosts)                    # configured hosts first, then the rest
-            complete_list configured
+        hosts)                    # enabled hosts (and aliases) first, then the rest
+            complete_list enabled
             complete_list other ;;
-        configured)               # hosts saypipe has settings or links for, and aliases
-            {
-                list_entries gpu; list_entries audio; list_entries share; list_entries host
-                alias_names
-                default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done
-                complete_list links
-            } | sort -u ;;
-        other)                    # ssh config hosts that aren't configured
+        enabled)                  # enabled hosts, aliases and host links
+            { enabled_hosts; alias_names; complete_list links; } | sort -u ;;
+        enabled-hosts) enabled_hosts ;;
+        other)                    # ssh config hosts that aren't enabled
             [ "$(setting_get completion-hosts all)" = all ] || return 0
             awk 'NR == FNR { seen[$0] = 1; next } !seen[$0]' \
-                <(complete_list configured) \
+                <(complete_list enabled) \
                 <({ ssh_config_hosts; ssh_config_hosts /etc/ssh/ssh_config; } | sort -u) ;;
         gpu|audio|share) list_entries "$1" ;;
-        listed)   list_entries host ;;
         aliases)  alias_names ;;
         defaults) default_list | while read -r n _; do [ "$n" = '*' ] || printf '%s\n' "$n"; done ;;
         links)
@@ -741,7 +832,7 @@ complete_list() {
         options)
             printf '%s\n' --link --unlink --alias --unalias --gpu-add --gpu-remove \
                 --gpu-list --audio-add --audio-remove --audio-list --share-add \
-                --share-remove --share-list --share-exit --host-add --host-remove \
+                --share-remove --share-list --share-exit --host-add --host-delete \
                 --host-list --completion-hosts --list --probe --default-set \
                 --default-remove --default-list --global-default --global-default-remove --help ;;
     esac
@@ -888,8 +979,16 @@ EOF
     for f in ${enabled[@]+"${enabled[@]}"}; do
         case $f in share) shown+=(shared) ;; *) shown+=("$f") ;; esac
     done
-    if [ ${#shown[@]} -gt 0 ]; then probe_row enabled "$(IFS=,; echo "${shown[*]}" | sed 's/,/, /g')" ""
-    else probe_row enabled none ""; fi
+    if is_enabled "$h"; then probe_row host enabled ""
+    elif [ -n "$wp" ] && [ "$apply" = 1 ]; then
+        list_add host "$h" >/dev/null && probe_row host enabled "(added)"
+    elif [ -n "$wp" ]; then
+        probe_row host "-" "not enabled"; echo "  -> $SELF --host-add $h"
+    else
+        probe_row host "-" "not enabled (needs waypipe)"; suggest=()
+    fi
+    if [ ${#shown[@]} -gt 0 ]; then probe_row options "$(IFS=,; echo "${shown[*]}" | sed 's/,/, /g')" ""
+    else probe_row options none ""; fi
     if [ ${#suggest[@]} -gt 0 ]; then
         if [ "$apply" = 1 ]; then
             for feat in "${suggest[@]}"; do list_add "$feat" "$h" | sed 's/^/  /'; done
@@ -919,8 +1018,9 @@ if [ -z "$host" ]; then
     case "${1:-}" in
         --link|--unlink|--gpu-add|--gpu-remove|--audio-add|--audio-remove|\
         --share-add|--share-remove|--share-exit|--unalias|--default-remove|\
-        --host-add|--host-remove)
+        --host-add|--host-delete)
             op=$1; shift
+            if [ "$op" = --host-add ] && [ "${1:-}" = --force ]; then FORCE=1; shift; fi
             [ $# -gt 0 ] || { echo "$SELF: $op needs at least one host" >&2; exit 2; }
             case $op in
                 --link)         link_add "$@" ;;
@@ -931,8 +1031,8 @@ if [ -z "$host" ]; then
                 --audio-remove) list_remove audio "$@" ;;
                 --share-add)    list_add share "$@" ;;
                 --share-remove) list_remove share "$@" ;;
-                --host-add)     list_add host "$@" ;;
-                --host-remove)  list_remove host "$@" ;;
+                --host-add)     host_add "$@" ;;
+                --host-delete)  host_delete "$@" ;;
                 --share-exit)   share_exit "$@" ;;
                 --unalias)      alias_remove "$@" ;;
                 --default-remove) default_remove "$@" ;;
@@ -944,13 +1044,13 @@ if [ -z "$host" ]; then
         --gpu-list)   list_entries gpu; exit 0 ;;
         --audio-list) list_entries audio; exit 0 ;;
         --share-list) list_entries share; exit 0 ;;
-        --host-list)  list_entries host; exit 0 ;;
+        --host-list)  enabled_hosts; exit 0 ;;
         --completion-hosts)
             case "${2:-}" in
                 "")             echo "completion-hosts $(setting_get completion-hosts all)" ;;
-                all|configured) setting_set completion-hosts "$2" &&
+                all|enabled)    setting_set completion-hosts "$2" &&
                                     echo "completion-hosts $2 (applies to the next completion)" ;;
-                *) echo "$SELF: usage: $SELF --completion-hosts [all|configured]" >&2; exit 2 ;;
+                *) echo "$SELF: usage: $SELF --completion-hosts [all|enabled]" >&2; exit 2 ;;
             esac
             exit 0 ;;
         --default-set)

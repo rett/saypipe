@@ -42,10 +42,10 @@ complete -c saypipe -n __saypipe_first -l share-add -d 'share one ssh connection
 complete -c saypipe -n __saypipe_first -l share-remove -d 'stop sharing connections'
 complete -c saypipe -n __saypipe_first -l share-list -d 'list hosts with connection sharing'
 complete -c saypipe -n __saypipe_first -l share-exit -d 'close shared connections'
-complete -c saypipe -n __saypipe_first -l host-add -d 'add hosts to the host list'
-complete -c saypipe -n __saypipe_first -l host-remove -d 'remove hosts from the host list'
-complete -c saypipe -n __saypipe_first -l host-list -d 'list the host list'
-complete -c saypipe -n __saypipe_first -l completion-hosts -d 'complete all hosts or only configured ones'
+complete -c saypipe -n __saypipe_first -l host-add -d 'enable hosts (checks for waypipe)'
+complete -c saypipe -n __saypipe_first -l host-delete -d 'remove hosts and their options'
+complete -c saypipe -n __saypipe_first -l host-list -d 'list enabled hosts'
+complete -c saypipe -n __saypipe_first -l completion-hosts -d 'complete all hosts or only enabled ones'
 complete -c saypipe -n __saypipe_first -l list -d 'list every known host'
 complete -c saypipe -n __saypipe_first -l probe -d 'test what hosts support'
 complete -c saypipe -n __saypipe_first -l default-set -d "set a host's default command"
@@ -57,8 +57,9 @@ complete -c saypipe -n __saypipe_first -s h -l help -d 'show usage'
 
 # Arguments of the management options.
 complete -c saypipe -n '__saypipe_after --link --gpu-add --audio-add --share-add --host-add --probe' -k -a '(__saypipe_list hosts)' -d host
-complete -c saypipe -n '__saypipe_after --host-remove' -a '(__saypipe_list listed)' -d 'listed host'
-complete -c saypipe -n '__saypipe_at 2 --completion-hosts' -a 'all configured'
+complete -c saypipe -n '__saypipe_after --host-add' -l force -d 'skip the waypipe check'
+complete -c saypipe -n '__saypipe_after --host-delete' -a '(__saypipe_list enabled-hosts)' -d 'enabled host'
+complete -c saypipe -n '__saypipe_at 2 --completion-hosts' -a 'all enabled'
 complete -c saypipe -n '__saypipe_after --probe' -l apply -d 'enable supported features'
 complete -c saypipe -n '__saypipe_after --unlink' -a '(__saypipe_list links)' -d 'host link'
 complete -c saypipe -n '__saypipe_after --gpu-remove' -a '(__saypipe_list gpu)' -d 'GPU-enabled host'

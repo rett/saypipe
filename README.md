@@ -38,18 +38,10 @@ emerge or FreeBSD `pkg` through sudo or doas. Uninstalling keeps packages.
 `install.sh` installs completions for bash (with bash-completion), zsh and
 fish: options, hosts (from your ssh config, including `Include` files, and
 saypipe's own lists) and, after options like `--gpu-remove` or `--unalias`,
-only the hosts or aliases that apply. Hosts saypipe has settings, links or
-aliases for are listed first (zsh shows them as their own group), then the
-rest of your ssh config.
-
-To complete only hosts saypipe knows about, without the rest of your ssh
-config:
-
-```
-saypipe --completion-hosts configured    # or: all (the default)
-saypipe --host-add dna dev               # list hosts without enabling anything
-saypipe --host-remove dev
-``` System-wide installs use
+only the hosts or aliases that apply. Enabled hosts and aliases are listed
+first (zsh shows them as their own group), then the rest of your ssh config;
+`saypipe --completion-hosts enabled` offers only the enabled ones (`all` is the
+default). System-wide installs use
 `/usr/local/share` (fish falls back to `/etc/fish/completions` where it
 doesn't search there); `--user` installs link them into your own completion
 directories. For zsh with `--user`, add
@@ -121,6 +113,25 @@ Trade-off: a dropped connection closes every app on that host at once.
 Hosts not listed use whatever your ssh config says, so sharing configured
 there still works.
 
+## Enabled hosts
+
+saypipe keeps a list of enabled hosts. A host is enabled once saypipe has
+confirmed over ssh that it has waypipe:
+
+```
+saypipe --host-add myvm          # checks for waypipe, then enables it
+saypipe --host-add --force myvm  # enable without the check (e.g. host offline)
+saypipe --host-list              # enabled hosts
+saypipe --list                   # enabled hosts with their options
+saypipe --host-delete myvm       # remove it with all its options, aliases and link
+```
+
+Options (GPU, audio, sharing, default commands, aliases, links) belong to
+enabled hosts: setting one on a host that isn't enabled yet enables it first,
+with the same check. `--probe --apply` enables a host that has waypipe.
+Launching doesn't need an enabled host: `saypipe <host> <command>` works for
+any host ssh can reach.
+
 ## Host links and aliases
 
 `saypipe --link myvm` creates a `myvm` command, so `myvm foot` works like
@@ -177,7 +188,8 @@ myvm
   shared   yes     extra sessions reuse one connection
   gpu      yes     Virtio-GPU Venus (Quadro RTX 4000) on /dev/dri/renderD128
   audio    yes     reached local sound server: PulseAudio (on PipeWire 1.6.0)
-  enabled  shared
+  host     enabled
+  options  shared
   -> saypipe --gpu-add myvm
   -> saypipe --audio-add myvm
 ```
@@ -219,12 +231,13 @@ saypipe --share-add <host>...   sessions to host share one ssh connection
 saypipe --share-remove <host>...
 saypipe --share-list            list hosts with connection sharing
 saypipe --share-exit <host>...  close the shared connection (and its apps)
-saypipe --host-add <host>...    add hosts to the host list (nothing enabled)
-saypipe --host-remove <host>...
-saypipe --host-list             list the host list
-saypipe --completion-hosts [all|configured]
+saypipe --host-add [--force] <host>...
+                                enable hosts (checks they have waypipe)
+saypipe --host-delete <host>... remove hosts with their options, aliases, links
+saypipe --host-list             list enabled hosts
+saypipe --completion-hosts [all|enabled]
                                 complete all ssh config hosts or only known ones
-saypipe --list                  every known host, with GPU/audio/sharing notes
+saypipe --list                  enabled hosts with their options
 saypipe --probe <host>... [--apply]
                                 test what host supports (and enable it)
 ```
@@ -241,7 +254,8 @@ Host links go in `$SAYPIPE_BIN_DIR` (default `~/.local/bin`). They point at
 - `~/.config/saypipe/share-hosts`: connection-sharing opt-in, same format.
 - `~/.config/saypipe/aliases`: `<alias> <host>` per line.
 - `~/.config/saypipe/commands`: `<host> <command...>` per line.
-- `~/.config/saypipe/hosts`: the host list, one host per line.
+- `~/.config/saypipe/hosts`: enabled hosts, one per line (hosts with options
+  count as enabled too).
 - `~/.config/saypipe/settings`: `<key> <value>` per line (`completion-hosts`).
 - `$XDG_RUNTIME_DIR/saypipe/cm/`: control sockets of shared connections.
 - `~/.local/state/saypipe/errors.log`: failed launches.

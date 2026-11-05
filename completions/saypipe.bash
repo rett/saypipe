@@ -10,7 +10,7 @@ _saypipe() {
         words=("${COMP_WORDS[@]}") cword=$COMP_CWORD cur=${COMP_WORDS[COMP_CWORD]}
     fi
     local sp=${words[0]} kind='' extra=''
-    compopt -o nosort 2>/dev/null     # keep saypipe's order: configured hosts first
+    compopt -o nosort 2>/dev/null     # keep saypipe's order: enabled hosts first
 
     if [ "$cword" -eq 1 ]; then
         if [[ $cur == -* ]]; then
@@ -22,10 +22,11 @@ _saypipe() {
     fi
 
     case ${words[1]} in
-        --link|--gpu-add|--audio-add|--share-add|--host-add) kind=hosts ;;
-        --host-remove)    kind=listed ;;
+        --link|--gpu-add|--audio-add|--share-add) kind=hosts ;;
+        --host-add)       kind=hosts extra=--force ;;
+        --host-delete)    kind=enabled-hosts ;;
         --completion-hosts)
-            [ "$cword" -eq 2 ] && COMPREPLY=($(compgen -W "all configured" -- "$cur"))
+            [ "$cword" -eq 2 ] && COMPREPLY=($(compgen -W "all enabled" -- "$cur"))
             return ;;
         --probe)          kind=hosts extra=--apply ;;
         --unlink)         kind=links ;;
