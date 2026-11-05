@@ -40,7 +40,16 @@ fish: options, hosts (from your ssh config, including `Include` files, and
 saypipe's own lists) and, after options like `--gpu-remove` or `--unalias`,
 only the hosts or aliases that apply. Hosts saypipe has settings, links or
 aliases for are listed first (zsh shows them as their own group), then the
-rest of your ssh config. System-wide installs use
+rest of your ssh config.
+
+To complete only hosts saypipe knows about, without the rest of your ssh
+config:
+
+```
+saypipe --completion-hosts configured    # or: all (the default)
+saypipe --host-add dna dev               # list hosts without enabling anything
+saypipe --host-remove dev
+``` System-wide installs use
 `/usr/local/share` (fish falls back to `/etc/fish/completions` where it
 doesn't search there); `--user` installs link them into your own completion
 directories. For zsh with `--user`, add
@@ -210,6 +219,11 @@ saypipe --share-add <host>...   sessions to host share one ssh connection
 saypipe --share-remove <host>...
 saypipe --share-list            list hosts with connection sharing
 saypipe --share-exit <host>...  close the shared connection (and its apps)
+saypipe --host-add <host>...    add hosts to the host list (nothing enabled)
+saypipe --host-remove <host>...
+saypipe --host-list             list the host list
+saypipe --completion-hosts [all|configured]
+                                complete all ssh config hosts or only known ones
 saypipe --list                  every known host, with GPU/audio/sharing notes
 saypipe --probe <host>... [--apply]
                                 test what host supports (and enable it)
@@ -227,6 +241,8 @@ Host links go in `$SAYPIPE_BIN_DIR` (default `~/.local/bin`). They point at
 - `~/.config/saypipe/share-hosts`: connection-sharing opt-in, same format.
 - `~/.config/saypipe/aliases`: `<alias> <host>` per line.
 - `~/.config/saypipe/commands`: `<host> <command...>` per line.
+- `~/.config/saypipe/hosts`: the host list, one host per line.
+- `~/.config/saypipe/settings`: `<key> <value>` per line (`completion-hosts`).
 - `$XDG_RUNTIME_DIR/saypipe/cm/`: control sockets of shared connections.
 - `~/.local/state/saypipe/errors.log`: failed launches.
 

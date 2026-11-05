@@ -22,7 +22,11 @@ _saypipe() {
     fi
 
     case ${words[1]} in
-        --link|--gpu-add|--audio-add|--share-add) kind=hosts ;;
+        --link|--gpu-add|--audio-add|--share-add|--host-add) kind=hosts ;;
+        --host-remove)    kind=listed ;;
+        --completion-hosts)
+            [ "$cword" -eq 2 ] && COMPREPLY=($(compgen -W "all configured" -- "$cur"))
+            return ;;
         --probe)          kind=hosts extra=--apply ;;
         --unlink)         kind=links ;;
         --gpu-remove)     kind=gpu ;;

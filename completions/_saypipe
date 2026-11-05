@@ -39,6 +39,10 @@ _saypipe() {
         '--share-remove:stop sharing connections'
         '--share-list:list hosts with connection sharing'
         '--share-exit:close shared connections'
+        '--host-add:add hosts to the host list'
+        '--host-remove:remove hosts from the host list'
+        '--host-list:list the host list'
+        '--completion-hosts:complete all hosts or only configured ones'
         '--list:list every known host'
         '--probe:test what hosts support'
         '--default-set:set a host'\''s default command'
@@ -59,7 +63,9 @@ _saypipe() {
     fi
 
     case $words[2] in
-        --link|--gpu-add|--audio-add|--share-add) __saypipe_hosts ;;
+        --link|--gpu-add|--audio-add|--share-add|--host-add) __saypipe_hosts ;;
+        --host-remove)    __saypipe_add listed 'listed host' ;;
+        --completion-hosts) (( CURRENT == 3 )) && compadd -- all configured ;;
         --probe)          compadd -- --apply; __saypipe_hosts ;;
         --unlink)         __saypipe_add links 'host link' ;;
         --gpu-remove)     __saypipe_add gpu 'GPU-enabled host' ;;
