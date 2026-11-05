@@ -34,7 +34,7 @@
 # Host links (--link) go in $SAYPIPE_BIN_DIR, default ~/.local/bin. Install
 # and uninstall with install.sh.
 #
-# Needs bash (3.2 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
+# Needs bash (4.4 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
 
 set -u
 
@@ -115,6 +115,11 @@ share_opts() {
                -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
 }
 
+# pulse_socket: the local PulseAudio (or pipewire-pulse) socket path.
+pulse_socket() {
+    printf '%s\n' "${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse}/native"
+}
+
 # audio_setup <host>: for an audio-enabled host, forward the local PulseAudio
 # socket to a random remote path over the same ssh connection and point the
 # remote app at it. Sets AUDIO_SSH (ssh options), AUDIO_ENV (command prefix)
@@ -122,7 +127,7 @@ share_opts() {
 AUDIO_SSH=(); AUDIO_ENV=(); AUDIO_RSOCK=; AUDIO_LSOCK=
 audio_setup() {
     is_audio_host "$1" || return 0
-    AUDIO_LSOCK="${PULSE_RUNTIME_PATH:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/pulse}/native"
+    AUDIO_LSOCK=$(pulse_socket)
     if [ ! -S "$AUDIO_LSOCK" ]; then
         echo "$SELF: audio: no PulseAudio socket at $AUDIO_LSOCK; continuing without audio" >&2
         AUDIO_LSOCK=
@@ -187,6 +192,9 @@ Management (as $SELF only):
   $SELF --share-list            list hosts with connection sharing
   $SELF --share-exit <host>...  close the shared connection (closes its apps)
   $SELF --list                  every known host, with GPU/audio/sharing notes
+  $SELF --probe <host>... [--apply]
+                                test which features <host> supports; --apply
+                                enables the supported ones
 EOF
 }
 
@@ -415,6 +423,155 @@ share_exit() {
     done
 }
 
+# ---- probe ------------------------------------------------------------------
+
+# Facts gathered on the remote host (POSIX sh, run with `sh -s` so the login
+# shell doesn't matter). One "key=value" per line.
+PROBE_REMOTE='
+if command -v waypipe >/dev/null 2>&1; then
+    v=$(waypipe --version 2>&1)
+    printf "waypipe=%s\n" "$(printf "%s\n" "$v" | head -n 1)"
+    case $v in *"dmabuf: true"*) echo dmabuf=yes ;; *"dmabuf: false"*) echo dmabuf=no ;; esac
+else
+    echo waypipe=
+fi
+for n in /dev/dri/renderD*; do
+    [ -c "$n" ] || continue
+    if [ -r "$n" ] && [ -w "$n" ]; then echo "render=$n"; else echo "render_noaccess=$n"; fi
+done
+if command -v vulkaninfo >/dev/null 2>&1; then
+    echo vulkaninfo=yes
+    vulkaninfo --summary 2>/dev/null | awk -F"= *" "/deviceType/ {t=\$2} /deviceName/ {print \"vkdev=\" t \"|\" \$2}"
+fi
+'
+
+# probe_row <name> <result> <detail>
+probe_row() { printf '  %-8s %-7s %s\n' "$1" "$2" "$3"; }
+
+# probe_host <host> <apply>: test ssh, connection sharing, GPU and audio support
+# on <host> over one temporary shared connection (one TCP connection in total,
+# so ssh rate limits aren't tripped), print the results and what to enable.
+probe_host() {
+    local h=$1 apply=$2 dir m key val facts
+    local wp='' dmabuf='' render='' noaccess='' vulkaninfo='' hwdev='' cpudev=''
+    local share=no share_why gpu=no gpu_why audio=no audio_why lsock rsock out
+    local feat enabled=() suggest=() wrong=()
+
+    dir=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-probe.XXXXXX") || { die_soft "cannot create a temp dir"; return; }
+    m=(-o "ControlPath=$dir/%C" -o ConnectTimeout=10)
+    echo "$h"
+    if ! ssh "${m[@]}" -o ControlMaster=yes -o ControlPersist=no -fN "$h"; then
+        probe_row ssh FAILED "cannot connect (see the ssh error above)"
+        rm -rf -- "$dir"; mgmt_rc=1; return
+    fi
+    probe_row ssh ok "connected"
+
+    # Everything else runs as extra sessions over that connection; if they
+    # work, connection sharing works.
+    if facts=$(ssh "${m[@]}" -o ControlMaster=no "$h" sh -s <<< "$PROBE_REMOTE"); then
+        share=yes; share_why="extra sessions reuse one connection"
+    else
+        share_why="sessions over a shared connection failed"
+        facts=$(ssh "${m[@]}" -o ControlMaster=no -o ControlPath=none "$h" sh -s <<< "$PROBE_REMOTE") || facts=
+    fi
+    while IFS='=' read -r key val; do
+        case $key in
+            waypipe)         wp=$val ;;
+            dmabuf)          dmabuf=$val ;;
+            render)          render=${render:-$val} ;;
+            render_noaccess) noaccess=${noaccess:-$val} ;;
+            vulkaninfo)      vulkaninfo=yes ;;
+            vkdev)           case $val in *CPU*) cpudev=${cpudev:-${val#*|}} ;;
+                                          *)     hwdev=${hwdev:-${val#*|}} ;; esac ;;
+        esac
+    done <<< "$facts"
+
+    if [ -n "$wp" ]; then probe_row waypipe ok "$wp${dmabuf:+ (dmabuf: $dmabuf)}"
+    else probe_row waypipe MISSING "install waypipe on $h"; fi
+
+    # GPU: waypipe needs dmabuf support, an accessible render node and a
+    # hardware Vulkan device (software Vulkan can't share GPU buffers).
+    if [ "$dmabuf" = no ]; then gpu_why="waypipe on $h is built without dmabuf"
+    elif [ -z "$render" ] && [ -n "$noaccess" ]; then gpu_why="no access to $noaccess (add the user to the render/video group)"
+    elif [ -z "$render" ]; then gpu_why="no GPU render node (/dev/dri/renderD*)"
+    elif [ -n "$hwdev" ]; then gpu=yes; gpu_why="$hwdev on $render"
+    elif [ -n "$vulkaninfo" ]; then gpu_why="only software Vulkan${cpudev:+ ($cpudev)} on $render"
+    else gpu=likely; gpu_why="render node $render; install vulkaninfo on $h to confirm Vulkan"
+    fi
+
+    # Audio: forward the local PulseAudio socket and talk to it from the host.
+    lsock=$(pulse_socket)
+    if [ ! -S "$lsock" ]; then
+        audio_why="no local PulseAudio socket at $lsock"
+    else
+        rsock=/tmp/saypipe-probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').sock
+        if out=$(ssh "${m[@]}" -o ControlMaster=no -o ExitOnForwardFailure=yes \
+                     -R "$rsock:$lsock" "$h" sh -s 2>/dev/null <<EOF
+if command -v pactl >/dev/null 2>&1; then
+    PULSE_SERVER=unix:$rsock pactl info 2>/dev/null | sed -n 's/^Server Name: //p'
+elif [ -S $rsock ]; then
+    if ls /usr/lib/libpulse.so.0 /usr/lib*/libpulse.so.0 /usr/lib/*/libpulse.so.0 >/dev/null 2>&1
+    then echo socket+libpulse; else echo socket-only; fi
+fi
+rm -f $rsock
+EOF
+        ); then
+            case $out in
+                "")             audio_why="forwarded, but nothing on $h could talk to it" ;;
+                socket+libpulse) audio=yes; audio_why="socket forwarding works; libpulse present" ;;
+                socket-only)    audio_why="socket forwarding works, but no libpulse/pactl on $h" ;;
+                *)              audio=yes; audio_why="reached local sound server: $out" ;;
+            esac
+        else
+            audio_why="sshd on $h refused the socket forward (AllowStreamLocalForwarding?)"
+        fi
+    fi
+    ssh "${m[@]}" -O exit "$h" >/dev/null 2>&1
+    rm -rf -- "$dir"
+
+    probe_row shared "$share" "$share_why"
+    probe_row gpu "$gpu" "$gpu_why"
+    probe_row audio "$audio" "$audio_why"
+
+    for feat in share gpu audio; do
+        local res
+        case $feat in share) res=$share ;; gpu) res=$gpu ;; audio) res=$audio ;; esac
+        if host_listed "$feat" "$h"; then
+            enabled+=("$feat")
+            [ "$res" = no ] && wrong+=("$feat")
+        elif [ "$res" = yes ]; then
+            suggest+=("$feat")
+        fi
+    done
+    local shown=() f
+    for f in ${enabled[@]+"${enabled[@]}"}; do
+        case $f in share) shown+=(shared) ;; *) shown+=("$f") ;; esac
+    done
+    if [ ${#shown[@]} -gt 0 ]; then probe_row enabled "$(IFS=,; echo "${shown[*]}" | sed 's/,/, /g')" ""
+    else probe_row enabled none ""; fi
+    if [ ${#suggest[@]} -gt 0 ]; then
+        if [ "$apply" = 1 ]; then
+            for feat in "${suggest[@]}"; do list_add "$feat" "$h" | sed 's/^/  /'; done
+        else
+            for feat in "${suggest[@]}"; do echo "  -> $SELF --$feat-add $h"; done
+        fi
+    fi
+    for feat in ${wrong[@]+"${wrong[@]}"}; do
+        echo "  !  $feat is enabled but not supported here: $SELF --$feat-remove $h"
+    done
+}
+
+# probe <host>... [--apply]
+probe() {
+    local h apply=0 hosts=()
+    for h; do [ "$h" = --apply ] && apply=1 || hosts+=("$h"); done
+    [ ${#hosts[@]} -gt 0 ] || { echo "$SELF: --probe needs at least one host" >&2; exit 2; }
+    for h in "${hosts[@]}"; do
+        if ! valid_host "$h"; then die_soft "invalid host name: '$h'"; continue; fi
+        probe_host "$h" "$apply"
+    done
+}
+
 if [ -z "$host" ]; then
     mgmt_rc=0
     case "${1:-}" in
@@ -438,6 +595,7 @@ if [ -z "$host" ]; then
         --audio-list) list_entries audio; exit 0 ;;
         --share-list) list_entries share; exit 0 ;;
         --list)       list_all; exit 0 ;;
+        --probe)      shift; probe "$@"; exit $mgmt_rc ;;
         --*)        [ "$1" = --help ] || { echo "$SELF: unknown option $1" >&2; usage; exit 2; } ;;
     esac
 fi

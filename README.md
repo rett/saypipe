@@ -15,7 +15,7 @@ Failures that mean something (ssh error, command not found) are appended to
 
 ## Install
 
-saypipe needs bash (3.2 or newer), an OpenSSH client and waypipe locally,
+saypipe needs bash (4.4 or newer), an OpenSSH client and waypipe locally,
 and waypipe on each remote host. It otherwise uses only POSIX tools, so it
 runs on Linux distributions and the BSDs.
 
@@ -98,6 +98,37 @@ Trade-off: a dropped connection closes every app on that host at once.
 Hosts not listed use whatever your ssh config says, so sharing configured
 there still works.
 
+## Probing a host
+
+`saypipe --probe <host>...` tests what a host supports and shows what's
+enabled:
+
+```
+$ saypipe --probe myvm
+myvm
+  ssh      ok      connected
+  waypipe  ok      waypipe 0.11.2 (dmabuf: yes)
+  shared   yes     extra sessions reuse one connection
+  gpu      yes     Virtio-GPU Venus (Quadro RTX 4000) on /dev/dri/renderD128
+  audio    yes     reached local sound server: PulseAudio (on PipeWire 1.6.0)
+  enabled  shared
+  -> saypipe --gpu-add myvm
+  -> saypipe --audio-add myvm
+```
+
+- **shared:** the probe runs over one temporary shared connection; extra
+  sessions over it must work. It opens a single TCP connection, so it won't
+  trip ssh rate limits.
+- **gpu:** waypipe built with dmabuf, an accessible `/dev/dri/renderD*` and a
+  hardware Vulkan device (software Vulkan doesn't count). Without `vulkaninfo`
+  on the host the result is `likely`.
+- **audio:** forwards your PulseAudio socket for real and asks the sound
+  server for its name through it.
+
+`--probe <host> --apply` enables every supported feature that's off. Features
+that are enabled but unsupported get a warning with the command to turn them
+off; `--apply` doesn't remove anything.
+
 ## Management
 
 ```
@@ -114,6 +145,8 @@ saypipe --share-remove <host>...
 saypipe --share-list            list hosts with connection sharing
 saypipe --share-exit <host>...  close the shared connection (and its apps)
 saypipe --list                  every known host, with GPU/audio/sharing notes
+saypipe --probe <host>... [--apply]
+                                test what host supports (and enable it)
 ```
 
 `--list` marks a shared host `shared (connected)` while its master is open.
