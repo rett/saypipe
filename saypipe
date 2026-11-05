@@ -52,8 +52,7 @@ ERROR_LOG="$STATE_DIR/errors.log"
 name=${0##*/}
 name=${name%.sh}
 host=
-via_link=0                    # started through a host link (or alias link)?
-[ "$name" != "$SELF" ] && { host=$name; via_link=1; }
+[ "$name" != "$SELF" ] && host=$name
 
 # resolve <path>: absolute path with all symlinks resolved (readlink -f where
 # available, else realpath, else a manual walk).
@@ -235,8 +234,8 @@ Management (as $SELF only):
   $SELF --default-remove <host>...
   $SELF --default-list          list default commands
   $SELF --global-default <command...>
-                                command host links run when their host has no
-                                default (not used for '$SELF <host>')
+                                command hosts run when given none and they
+                                have no default of their own
   $SELF --global-default-remove
   $SELF --gpu-add <host>...     let <host> use GPU buffers (run without -n)
   $SELF --gpu-remove <host>...  back to -n for <host>
@@ -538,8 +537,8 @@ default_write() {
         cat > "$COMMANDS_FILE" <<'EOF'
 # saypipe default commands: "<host> <command...>" per line. Running a host
 # (or an alias for it) without a command runs this one. A "*" line is the
-# global default, used for hosts without one, but only when started through
-# a host link. Only whole-line comments: commands may contain '#'.
+# global default, used for hosts without one. Only whole-line comments:
+# commands may contain '#'.
 EOF
     fi
     [ -s "$COMMANDS_FILE" ] && [ -n "$(tail -c 1 "$COMMANDS_FILE")" ] && echo >> "$COMMANDS_FILE"
@@ -558,13 +557,13 @@ default_remove() {
     done
 }
 
-# global_set <command...>: the command host links run when the host has no
-# default of its own.
+# global_set <command...>: the command a host runs when given none and it
+# has no default of its own.
 global_set() {
     local c="$*"
     case $c in *$'\n'*) die_soft "the command must be on one line"; return ;; esac
     [ -n "${c//[[:space:]]/}" ] || { die_soft "no command given"; return; }
-    default_write '*' "$c" "global (host links only)"
+    default_write '*' "$c" "global"
 }
 
 global_remove() {
@@ -579,7 +578,7 @@ default_list() {
     while IFS= read -r l || [ -n "$l" ]; do
         read -r k rest <<< "$l"
         case ${k:-} in ""|"#"*) continue ;; esac
-        [ "$k" = '*' ] && k="* (global, links only)"
+        [ "$k" = '*' ] && k="* (global)"
         [ -n "${rest:-}" ] && printf '%-20s %s\n' "$k" "$rest"
     done < "$COMMANDS_FILE"
 }
@@ -619,7 +618,7 @@ list_all() {
             then notes+=("shared (connected)"); else notes+=(shared); fi
         fi
         if c=$(default_cmd "$t"); then notes+=("runs: $c")
-        elif is_our_link "$LINK_DIR/$n" && c=$(default_cmd '*'); then
+        elif c=$(default_cmd '*'); then
             notes+=("runs: $c (global default)")
         fi
         if [ ${#notes[@]} -eq 0 ]; then
@@ -906,16 +905,13 @@ if [ -z "$host" ]; then
 fi
 # An alias (from a link or the command line) stands for its real host.
 if t=$(alias_target "$host"); then host=$t; fi
-# No command: run the host's default (--default-set) or, when started through
-# a host link, the global default (--global-default).
+# No command: run the host's default (--default-set), else the global
+# default (--global-default).
 if [ $# -eq 0 ]; then
-    if c=$(default_cmd "$host"); then
-        set -- "$c"
-    elif [ "$via_link" = 1 ] && c=$(default_cmd '*'); then
+    if c=$(default_cmd "$host") || c=$(default_cmd '*'); then
         set -- "$c"
     else
-        hint="'$SELF --default-set $host <command>'"
-        [ "$via_link" = 0 ] || hint="$hint or '$SELF --global-default <command>'"
+        hint="'$SELF --default-set $host <command>' or '$SELF --global-default <command>'"
         echo "$SELF: no command given for $host (set a default with $hint)" >&2
         exit 1
     fi

@@ -139,12 +139,11 @@ saypipe --default-remove myvm
 saypipe --default-list
 ```
 
-A global default covers hosts without their own, but only when started
-through a host link (or alias link); `saypipe <host>` with no command still
-needs a per-host default:
+A global default covers every host without its own, whether started as
+`myvm` (a link) or `saypipe myvm`:
 
 ```
-saypipe --global-default ghostty      # `anyhost` alone opens ghostty
+saypipe --global-default ghostty      # `saypipe anyhost` opens ghostty
 saypipe --global-default-remove
 ```
 
@@ -197,7 +196,7 @@ saypipe --default-set <host> <command...>
 saypipe --default-remove <host>...
 saypipe --default-list          list default commands
 saypipe --global-default <command...>
-                                command host links run when the host has none
+                                command hosts without a default run
 saypipe --global-default-remove
 saypipe --gpu-add <host>...     host runs without -n
 saypipe --gpu-remove <host>...  host goes back to -n
