@@ -33,6 +33,15 @@ what's missing from your PATH, using apt, dnf, yum, zypper, pacman, apk, xbps,
 emerge or FreeBSD `pkg` through sudo or doas. Uninstalling keeps packages.
 `PREFIX` changes `/usr/local`; `SAYPIPE_BIN_DIR` changes `~/.local/bin`.
 
+### Newer waypipe (optional)
+
+saypipe works with your distribution's waypipe. If that one is too old (common
+on LTS releases), `scripts/build-waypipe.sh` builds the latest waypipe release
+with all features on apt-based systems and installs it to `/usr/local`. It
+also builds a private ffmpeg in `/opt/ffmpeg-waypipe` if the system's is too
+old for waypipe's video support. Rerun it to update. It needs sudo and takes
+a while.
+
 ## Per-host waypipe options
 
 | Host | Options | Why |
