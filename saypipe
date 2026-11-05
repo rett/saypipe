@@ -351,10 +351,14 @@ if [ "${1:-}" = "--run" ]; then
     rc=$?
     audio_cleanup "$host"
     # Apps often exit non-zero when their window is closed (e.g. foot gives 1),
-    # so only record codes that mean a real failure: 255 = ssh error,
-    # 127/126 = command not found / not executable.
-    case $rc in
-        255|127|126)
+    # so only record what means a real failure: 255 = ssh error, 127/126 =
+    # command not found / not executable, and waypipe's own "Failed to run
+    # program" (it exits 1 when the command doesn't exist on the host).
+    failed=0
+    case $rc in 255|127|126) failed=1 ;; esac
+    grep -q 'Failed to run program' "$log" 2>/dev/null && failed=1
+    case $failed in
+        1)
             if mkdir -p "$STATE_DIR" 2>/dev/null; then
                 {
                     printf '[%s] waypipe %s ssh %s %s: exit %s\n' \
@@ -1198,15 +1202,15 @@ launch() {
     while [ $n -lt "$max" ] && [ ! -s "$status" ]; do sleep "$step"; n=$((n + 1)); done
     rc=0
     if [ -s "$status" ]; then
+        # The app ended while we were watching: any error exit this early
+        # means it didn't start (e.g. the command doesn't exist there).
         rc=$(head -n 1 "$status")
-        case $rc in
-            255|127|126)
-                {
-                    printf '%s: %s on %s failed (exit %s):\n' "$SELF" "${*:2}" "$h" "$rc"
-                    tail -n +2 "$status" | sed 's/^/  /'
-                } >&2 ;;
-            *) rc=0 ;;
-        esac
+        if [ "$rc" != 0 ]; then
+            {
+                printf '%s: %s on %s failed (exit %s):\n' "$SELF" "${*:2}" "$h" "$rc"
+                tail -n +2 "$status" | sed 's/^/  /'
+            } >&2
+        fi
     fi
     rm -f -- "$status"
     return "$rc"
