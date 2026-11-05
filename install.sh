@@ -251,10 +251,10 @@ do_install() {
 
 Done. Next steps:
   saypipe <host> <command>          launch an app, e.g. saypipe myvm foot
-  saypipe --link <host>             create a <host> shortcut in ~/.local/bin
-  saypipe --gpu-add <host>          GPU buffers for hosts with a usable GPU
-  saypipe --audio-add <host>        play the host's app audio here
-  saypipe --share-add <host>        share one ssh connection per host
+  saypipe --host-add <host>         enable a host (checks it has waypipe)
+  saypipe --probe --apply <host>    test what it supports and turn that on
+  saypipe --link-add <host>         make <host> a command in ~/.local/bin
+  saypipe --help                    everything else
 Remote hosts need waypipe installed.
 EOF
 }
