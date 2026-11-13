@@ -40,7 +40,11 @@ shift
 exec "$@"
 MOCK
 chmod +x "$SAYPIPE_BIN_DIR/ssh" "$SAYPIPE_BIN_DIR/waypipe" "$SAYPIPE_BIN_DIR/dbus-run-session"
-"$app" --foreground testhost 'printf "%s" "$PULSE_SERVER"' > "$TEST_ROOT/out"
+audio_command=$(cat <<'REMOTE'
+sh -c 'printf "%s" "$PULSE_SERVER"'
+REMOTE
+)
+"$app" --foreground testhost "$audio_command" > "$TEST_ROOT/out"
 grep -q '^unix:/tmp/saypipe-pulse-' "$TEST_ROOT/out"
 grep -q -- '-R /tmp/saypipe-pulse-' "$AUDIO_CALLS"
 grep -q -- '-O cancel' "$AUDIO_CALLS"

@@ -64,10 +64,14 @@ for expected in 1 126 127; do
 done
 grep -q 'exit 127' "$XDG_STATE_HOME/saypipe/errors.log"
 # Real login shells parse the outer SSH text, including octal command payloads.
+login_command=$(cat <<'REMOTE'
+printf '%s' "a'b \$literal" > "$TEST_OUTPUT"
+REMOTE
+)
 for shell in fish tcsh; do
     login_shell=$(command -v "$shell" || true)
     if [ -n "$login_shell" ]; then
-        TEST_LOGIN_SHELL=$login_shell "$project_dir/saypipe" --run testhost "printf '%s' \"a'b \\\\$literal\" > \"\$TEST_OUTPUT\""
+        TEST_LOGIN_SHELL=$login_shell "$project_dir/saypipe" --run testhost "$login_command"
         [ "$(cat "$TEST_OUTPUT")" = "a'b \$literal" ]
     else
         printf 'skip: %s remote login shell unavailable\n' "$shell"

@@ -15,6 +15,7 @@ case $TEST_SCENARIO in
  bad-version) echo '@@saypipe-waypipe@@1|version failed'; exit 0 ;;
  connection) exit 255 ;;
  timeout) exec sleep 30 ;;
+ interrupt) printf "%s" "$$" > "$TEST_SSH_PID"; exec sleep 30 ;;
  *) printf 'login banner\n@@saypipe-waypipe@@0|custom dev build\nshell=/bin/sh\ntool=sh\ntool=dbus-run-session\ntool=xdg-desktop-portal\nportal=gtk.portal\n' ;;
 esac
 MOCK
@@ -46,4 +47,27 @@ snippet=${snippet//\/usr\/lib/"$TEST_ROOT/lib"}
 snippet=${snippet//\/usr\/local\/lib/"$TEST_ROOT/other"}
 result=$(sh -c "$snippet")
 [ "$result" = socket+libpulse ]
+# Ctrl-C must interrupt the public probe immediately, including async SSH.
+if command -v python3 >/dev/null 2>&1; then
+    export TEST_SCENARIO=interrupt TEST_SSH_PID=$TEST_ROOT/ssh-pid
+    : > "$PROBE_CALLS"
+    python3 - "$app" <<'PYTEST'
+import os,signal,subprocess,sys,time
+proc=subprocess.Popen([sys.argv[1],'--probe','testhost'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+try:
+    deadline=time.monotonic()+5
+    while not os.path.exists(os.environ['TEST_SSH_PID']):
+        if time.monotonic()>deadline:
+            raise AssertionError('probe child never started')
+        time.sleep(.02)
+    os.killpg(proc.pid,signal.SIGINT)
+    assert proc.wait(timeout=3)!=0
+finally:
+    if proc.poll() is None:
+        os.killpg(proc.pid,signal.SIGKILL)
+        proc.wait()
+PYTEST
+    grep -q -- '-O exit' "$PROBE_CALLS"
+    [ -z "$(find "$TMPDIR" -name 'saypipe-probe.*' -print)" ]
+fi
 printf 'probe checks passed\n'

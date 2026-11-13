@@ -11,7 +11,7 @@ case $TEST_CASE in
  close) sleep 2; exit 1 ;;
  output) printf 'visible output\n'; exit 0 ;;
  flood) dd if=/dev/zero bs=4096 count=64 2>/dev/null | tr '\000' x; exit 3 ;;
- wait) exec sleep 30 ;;
+ wait) [ -z "${WAIT_PID:-}" ] || printf '%s' "$$" > "$WAIT_PID"; exec sleep 30 ;;
 esac
 MOCK
 chmod +x "$SAYPIPE_BIN_DIR/waypipe"
@@ -38,4 +38,21 @@ sleep 0.3
 kill -TERM "$worker"
 wait "$worker" && exit 1
 [ -z "$(find "$TMPDIR" -name 'saypipe-session.*' -print)" ]
+# The public foreground entry must forward TERM to the worker and transport.
+export WAIT_PID=$TEST_ROOT/wait-pid
+"$app" --foreground demo app & launcher=$!
+for n in {1..100}; do [ -s "$WAIT_PID" ] && break; sleep 0.05; done
+transport=$(cat "$WAIT_PID")
+kill -TERM "$launcher"
+wait "$launcher" && exit 1
+! kill -0 "$transport" 2>/dev/null
+# A detached startup watch owns only its status directory, not the app.
+rm -f "$WAIT_PID"
+SAYPIPE_WAIT=30 "$app" demo app & launcher=$!
+for n in {1..100}; do [ -s "$WAIT_PID" ] && break; sleep 0.05; done
+kill -TERM "$launcher"
+wait "$launcher" && exit 1
+[ -z "$(find "$TMPDIR" -name 'saypipe-status.*' -print)" ]
+kill -TERM "$(cat "$WAIT_PID")"
+sleep 0.2
 printf 'launch error checks passed\n'

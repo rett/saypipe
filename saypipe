@@ -183,6 +183,18 @@ config_unlock() {
     [ -z "$CONFIG_LOCK_EXIT" ] || eval "$CONFIG_LOCK_EXIT"
     [ -z "$CONFIG_LOCK_SIGNALS" ] || eval "$CONFIG_LOCK_SIGNALS"
 }
+config_lock_exit() {
+    local previous=$CONFIG_LOCK_EXIT
+    CONFIG_LOCK_DEPTH=1
+    config_unlock
+    # Restoring an EXIT trap while already handling EXIT does not run it.
+    # Chain the previous handler explicitly, preserving its shell quoting.
+    trap - EXIT
+    if [ -n "$previous" ]; then
+        eval "set -- ${previous#trap -- }"
+        eval "$1"
+    fi
+}
 config_lock() {
     if [ "$CONFIG_LOCK_DEPTH" -gt 0 ]; then
         CONFIG_LOCK_DEPTH=$((CONFIG_LOCK_DEPTH + 1)); return 0
@@ -220,7 +232,7 @@ config_lock() {
     trap 'exit 130' INT
     trap 'exit 143' TERM
     trap 'exit 129' HUP
-    trap 'CONFIG_LOCK_DEPTH=1; config_unlock' EXIT
+    trap config_lock_exit EXIT
 }
 
 # config_edit FILE MODE KEY [VALUE]: replace a complete file while holding
@@ -541,6 +553,7 @@ if [ "${1:-}" = "--run" ]; then
         [ "$cleaned" = 0 ] || return 0
         cleaned=1
         [ -z "$waypipe_pid" ] || kill -TERM "$waypipe_pid" 2>/dev/null || true
+        [ -z "$waypipe_pid" ] || wait "$waypipe_pid" 2>/dev/null || true
         [ -z "$capture_pid" ] || kill -TERM "$capture_pid" 2>/dev/null || true
         [ -z "$drain_pid" ] || kill -TERM "$drain_pid" 2>/dev/null || true
         audio_cleanup "$host"
@@ -777,7 +790,11 @@ host_remove() {
             rm -f -- "$LINK_DIR/$h" || { die_soft "cannot remove $LINK_DIR/$h"; continue; }
             echo "$h: link removed"
         fi
-        echo "$h: removed (with its options)"
+        if [[ $h == *@* ]] && is_enabled "$h"; then
+            echo "$h: exact entries removed (still inherits from ${h##*@})"
+        else
+            echo "$h: removed (with its options)"
+        fi
     done
 }
 
@@ -827,14 +844,16 @@ option_remove() {
             continue
         fi
         if list_drop "$kind" "$h"; then
+            if host_listed "$kind" "$h"; then
+                echo "$h: $label entry removed (still inherited from ${h##*@})"
+                continue
+            fi
             case $kind in
                 gpu)   echo "$h: GPU disabled (runs with -n)" ;;
                 audio) echo "$h: audio disabled" ;;
                 share) echo "$h: connection sharing disabled" \
                             "(an open master stays until '$SELF --share-exit $h' or it times out)" ;;
             esac
-            host_listed "$kind" "$h" &&
-                die_soft "$h: $label is still enabled through another entry (e.g. without user@)"
             continue
         fi
         # "alice@myvm" lines match "myvm" only one way round: point to them.
@@ -1128,6 +1147,18 @@ bounded_probe() {
     local child timer sleeper rc marker
     marker=$(mktemp "$dir/timeout.XXXXXX") || return 1
     "$@" <&3 & child=$!
+    bounded_cancel() {
+        local status=$1
+        trap - INT TERM HUP
+        kill -TERM "$child" "${timer:-}" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+        [ -z "${timer:-}" ] || wait "$timer" 2>/dev/null || true
+        rm -f "$marker"
+        exit "$status"
+    }
+    trap 'bounded_cancel 130' INT
+    trap 'bounded_cancel 143' TERM
+    trap 'bounded_cancel 129' HUP
     (
         trap 'kill "$sleeper" 2>/dev/null || true; exit 0' TERM INT
         sleep "${SAYPIPE_PROBE_TIMEOUT:-15}" & sleeper=$!
@@ -1140,6 +1171,7 @@ bounded_probe() {
     wait "$child"; rc=$?
     kill "$timer" 2>/dev/null || true
     wait "$timer" 2>/dev/null || true
+    trap - INT TERM HUP
     if [ -s "$marker" ]; then rm -f "$marker"; echo "saypipe: remote probe timed out" >&2; return 124; fi
     rm -f "$marker"
     return "$rc"
@@ -1178,6 +1210,8 @@ probe_host() (
     if facts=$(bounded_probe ssh "${m[@]}" -o ControlMaster=no "$h" sh -s <<< "$PROBE_REMOTE"); then
         share=yes; share_why="extra sessions reuse one connection"
     else
+        rc=$?
+        case $rc in 129|130|143) return "$rc" ;; esac
         share_why="sessions over a shared connection failed"
         facts=$(bounded_probe ssh "${m[@]}" -o ControlMaster=no -o ControlPath=none "$h" sh -s <<< "$PROBE_REMOTE") || facts=
     fi
@@ -1455,13 +1489,31 @@ fi
 # SAYPIPE_WAIT seconds (default 2), so a launch that fails right away (ssh
 # error, command not found) is reported here instead of only in ERROR_LOG.
 launch() {
-    local h=$1 status rc step=0.1 max n=0
+    local h=$1 status='' rc step=0.1 max n=0 launch_pid=''
+    launch_cleanup() {
+        if [ -n "$launch_pid" ]; then
+            kill -TERM "$launch_pid" 2>/dev/null || true
+            wait "$launch_pid" 2>/dev/null || true
+        fi
+        [ -z "$status" ] || rm -rf -- "$status"
+    }
+    trap launch_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     if [ "${SAYPIPE_FOREGROUND:-0}" = 1 ]; then
-        "$0" --run "$@"
-        return "$?"
+        "$0" --run "$@" & launch_pid=$!
+        wait "$launch_pid"; rc=$?
+        launch_pid=
+        launch_cleanup
+        trap - EXIT INT TERM HUP
+        return "$rc"
     fi
     status=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-status.XXXXXX") || {
-        echo "$SELF: cannot create startup status directory" >&2; return 1;
+        echo "$SELF: cannot create startup status directory" >&2
+        launch_cleanup
+        trap - EXIT INT TERM HUP
+        return 1;
     }
     if ! SAYPIPE_STATUS=$status setsid -f "$0" --run "$@" </dev/null >/dev/null 2>&1; then
         SAYPIPE_STATUS=$status nohup "$0" --run "$@" </dev/null >/dev/null 2>&1 &
@@ -1480,7 +1532,8 @@ launch() {
         echo "$SELF: detached worker did not start; try --foreground" >&2
         rc=1
     fi
-    rm -rf -- "$status"
+    launch_cleanup
+    trap - EXIT INT TERM HUP
     return "$rc"
 }
 

@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: MIT
 # Source from test scripts to confine all application state and commands.
 set -euo pipefail
+unset PULSE_SERVER PULSE_RUNTIME_PATH SSH_AUTH_SOCK
 TEST_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-test.XXXXXX")
 trap 'rm -rf -- "$TEST_ROOT"' EXIT
 export HOME=$TEST_ROOT/home
