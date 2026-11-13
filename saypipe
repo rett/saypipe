@@ -34,6 +34,10 @@
 # Host links (--link-add) go in $SAYPIPE_BIN_DIR, default ~/.local/bin. Install
 # and uninstall with install.sh.
 #
+# A private remote D-Bus session, when dbus-run-session is available, lets
+# portal services inherit this launch's Wayland display instead of using the
+# shared user service environment. Hosts without it keep the normal session bus.
+#
 # Needs bash (4.4 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
 
 set -u
@@ -346,8 +350,18 @@ if [ "${1:-}" = "--run" ]; then
     wp_opts "$host"
     share_opts "$host"
     audio_setup "$host" 2>>"$log"
+    # SSH joins its command arguments as shell text. Keep that interpretation
+    # (including pipelines and configured default commands) inside the private
+    # bus, and quote it as one argument for the remote POSIX sh wrapper.
+    remote_command="${AUDIO_ENV[*]}${AUDIO_ENV[*]:+ }$*"
+    remote_command=${remote_command//\'/\'\\\'\'}
+    remote_session='if command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- sh -c "$1"
+else
+    exec sh -c "$1"
+fi'
     waypipe "${WP_OPTS[@]}" ssh "${SHARE_SSH[@]}" "${AUDIO_SSH[@]}" "$host" \
-        "${AUDIO_ENV[@]}" "$@" </dev/null >>"$log" 2>&1
+        "sh -c '$remote_session' saypipe '$remote_command'" </dev/null >>"$log" 2>&1
     rc=$?
     audio_cleanup "$host"
     # Apps often exit non-zero when their window is closed (e.g. foot gives 1),

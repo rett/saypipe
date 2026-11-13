@@ -76,6 +76,26 @@ enables it first, with the same check (`--force` works there too). Launching
 doesn't need an enabled host: `saypipe <host> <command>` works for any host
 ssh can reach.
 
+### File dialogs and D-Bus
+
+Every launch automatically uses a private D-Bus session when the remote host
+has `dbus-run-session`. Install it on the remote host for applications that
+use desktop portals, such as Electron file dialogs. The host also needs a
+file chooser portal backend, such as `xdg-desktop-portal-gtk`, and
+`xdg-desktop-portal`.
+
+Portal services then inherit the Wayland display created for that launch, so
+file dialogs open through the same waypipe connection. Concurrent launches
+get separate buses and displays. The bus ends when the command exits.
+
+A running single-instance app may reuse an older process and its bus. Fully quit
+that app before relaunching it to adopt the new session.
+
+The private bus also isolates the app from the host's shared session services,
+including existing D-Bus app instances and session keyrings. File dialogs
+browse files on the remote host. Hosts without `dbus-run-session` use their
+existing session bus and may still need portal environment configuration.
+
 ### GPU buffers
 
 | Host | waypipe options | Why |

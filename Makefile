@@ -16,5 +16,6 @@ test: doctor
 	sh -n install.sh
 	bash -n scripts/build-waypipe.sh
 	bash -n completions/saypipe.bash
+	bash tests/launch-session.sh
 	@if command -v zsh >/dev/null; then zsh -n completions/_saypipe; else echo "skip: zsh completion syntax (zsh unavailable)"; fi
 	@if command -v fish >/dev/null; then fish -n completions/saypipe.fish; else echo "skip: fish completion syntax (fish unavailable)"; fi
