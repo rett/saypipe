@@ -46,7 +46,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) ))
     exit 1
 fi
 set -u
-VERSION=0.0.2
+VERSION=0.1.0
 
 SELF=saypipe          # canonical name; any other name is treated as the host
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/saypipe"
