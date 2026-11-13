@@ -26,4 +26,16 @@ ln -s "$TEST_ROOT/new-commands" "$XDG_CONFIG_HOME/saypipe/commands"
 "$app" --default-set --global linked >/dev/null
 [ -L "$XDG_CONFIG_HOME/saypipe/commands" ]
 grep -q '^\* linked$' "$TEST_ROOT/new-commands"
+# An exhausted symlink walk must refuse the update, preserving every link.
+rm "$XDG_CONFIG_HOME/saypipe/commands"
+ln -s commands "$XDG_CONFIG_HOME/saypipe/commands"
+if "$app" --default-set --global cyclic >/dev/null 2>&1; then exit 1; fi
+[ -L "$XDG_CONFIG_HOME/saypipe/commands" ]
+rm "$XDG_CONFIG_HOME/saypipe/commands"
+ln -s "$TEST_ROOT/cycle-a" "$XDG_CONFIG_HOME/saypipe/commands"
+ln -s "$TEST_ROOT/cycle-b" "$TEST_ROOT/cycle-a"
+ln -s "$TEST_ROOT/cycle-a" "$TEST_ROOT/cycle-b"
+if "$app" --default-set --global cyclic >/dev/null 2>&1; then exit 1; fi
+[ -L "$XDG_CONFIG_HOME/saypipe/commands" ]
+[ -L "$TEST_ROOT/cycle-a" ] && [ -L "$TEST_ROOT/cycle-b" ]
 printf 'portable path resolution checks passed\n'

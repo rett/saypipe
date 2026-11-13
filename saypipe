@@ -84,6 +84,7 @@ resolve() {
         case $l in /*) p=$l ;; *) p=${p%/*}/$l ;; esac
         n=$((n + 1))
     done
+    [ ! -L "$p" ] || return 1
     d=$(cd -P -- "$(dirname -- "$p")" 2>/dev/null && pwd -P) || return 1
     printf '%s/%s\n' "$d" "${p##*/}"
 }

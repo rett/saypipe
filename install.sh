@@ -92,6 +92,7 @@ resolve() {
         case $_rl in /*) _rp=$_rl ;; *) _rp=${_rp%/*}/$_rl ;; esac
         _rn=$((_rn + 1))
     done
+    [ ! -L "$_rp" ] || return 1
     _rd=$(cd -P -- "$(dirname -- "$_rp")" 2>/dev/null && pwd -P) || return 1
     printf '%s/%s\n' "$_rd" "${_rp##*/}"
 }
