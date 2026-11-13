@@ -29,14 +29,11 @@
 #   FFMPEG_REBUILD=1             rebuild the private ffmpeg even if it qualifies
 #   FFMPEG_PREFIX=/opt/ffmpeg-waypipe   PREFIX=/usr/local   SRC=$HOME/src
 
-set -euo pipefail
-
 WAYPIPE_REPO=https://gitlab.freedesktop.org/mstoeckl/waypipe.git
 FFMPEG_REPO=https://git.ffmpeg.org/ffmpeg.git
 FFMPEG_PREFIX=${FFMPEG_PREFIX:-/opt/ffmpeg-waypipe}
 PREFIX=${PREFIX:-/usr/local}
 SRC=${SRC:-$HOME/src}
-JOBS=$(nproc)
 
 log()  { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33mWARNING: %s\033[0m\n' "$*" >&2; }
@@ -52,8 +49,65 @@ apt_has() {
     [[ -n $c && $c != "(none)" ]]
 }
 
-# own_tree <dir>: give a tree back to the current user (after sudo installs)
-own_tree() { [[ -e $1 ]] && sudo chown -R "$(id -u):$(id -g)" "$1"; return 0; }
+# Reject ambiguous paths and symlinked ancestors before any privileged operation.
+validate_prefix() {
+    local path=${1%/}
+    [[ $path == /* && $path != *$'\n'* && $path != *$'\r'* ]] || return 1
+    case /${path#/}/ in */../*|*/./*|*//*) return 1 ;; esac
+    case $path in ''|/|/opt|/usr|/usr/local|/bin|/sbin|/lib|/lib64|/etc|/home|/var|/tmp) return 1 ;; esac
+    [[ $(realpath -m -- "$path") == "$path" ]] || return 1
+}
+
+prefix_owned() {
+    [[ -d $1 && ! -L $1 && -f $1/.build-info && ! -L $1/.build-info ]] &&
+        [[ $(head -n 1 "$1/.build-info") == 'saypipe-build-ffmpeg-v1' ]]
+}
+
+check_prefix() {
+    validate_prefix "$FFMPEG_PREFIX" || die "unsafe FFMPEG_PREFIX: $FFMPEG_PREFIX"
+    FFMPEG_PREFIX=${FFMPEG_PREFIX%/}
+    if [[ -e $FFMPEG_PREFIX || -L $FFMPEG_PREFIX ]]; then
+        prefix_owned "$FFMPEG_PREFIX" || die "unowned FFmpeg prefix: $FFMPEG_PREFIX"
+    fi
+}
+
+# Recognize clean shallow upstream clones too, but never claim arbitrary trees.
+checkout_source() {
+    local dir=$1 repo=$2 ref=$3
+    if [[ -e $dir || -L $dir ]]; then
+        [[ -d $dir/.git && ! -L $dir && ! -L $dir/.git ]] || die "unfamiliar source tree: $dir"
+        [[ $(git -C "$dir" remote get-url origin) == "$repo" ]] || die "unexpected origin: $dir"
+        [[ -z $(git -C "$dir" status --porcelain --untracked-files=all) ]] || die "dirty source tree: $dir"
+        if [[ ! -f $dir/.git/saypipe-build-owned ]]; then
+            [[ $(git -C "$dir" rev-parse --is-shallow-repository) == true ]] || die "unowned source tree: $dir"
+        else
+            [[ $(cat "$dir/.git/saypipe-build-owned") == "$repo" ]] || die "invalid source marker: $dir"
+        fi
+        git -C "$dir" fetch --depth 1 origin "$ref"
+        git -C "$dir" -c advice.detachedHead=false checkout --detach -q FETCH_HEAD
+    else
+        git clone --depth 1 --branch "$ref" "$repo" "$dir"
+        git -C "$dir" -c advice.detachedHead=false checkout --detach -q HEAD
+    fi
+    printf '%s\n' "$repo" > "$dir/.git/saypipe-build-owned"
+}
+
+prepare_build_dir() {
+    local dir=$1 source=$2
+    [[ ! -L $dir ]] || die "symlinked build directory: $dir"
+    if [[ -e $dir ]]; then
+        [[ -d $dir && -f $dir/.saypipe-build-owned && ! -L $dir/.saypipe-build-owned ]] &&
+            [[ $(cat "$dir/.saypipe-build-owned") == "$source" ]] || die "unowned build directory: $dir"
+        rm -rf -- "$dir"
+    fi
+    mkdir -- "$dir"
+    printf '%s\n' "$source" > "$dir/.saypipe-build-owned"
+}
+
+main() {
+set -euo pipefail
+JOBS=$(nproc)
+check_prefix
 
 [[ $EUID -eq 0 ]] && die "run as your normal user, not root (sudo is used where needed)"
 command -v apt-get >/dev/null 2>&1 ||
@@ -89,13 +143,8 @@ else
     echo "Latest release: $WAYPIPE_VER"
 fi
 
-if [[ ! -d $SRC/waypipe/.git ]]; then
-    git clone --branch "$WAYPIPE_VER" --depth 1 "$WAYPIPE_REPO" "$SRC/waypipe"
-fi
+checkout_source "$SRC/waypipe" "$WAYPIPE_REPO" "$WAYPIPE_VER"
 cd "$SRC/waypipe"
-git fetch --depth 1 origin tag "$WAYPIPE_VER" >/dev/null 2>&1 || true
-git -c advice.detachedHead=false checkout -q "$WAYPIPE_VER" ||
-    die "cannot check out $WAYPIPE_VER in $SRC/waypipe"
 
 # meson_min <name>: minimum version waypipe's meson.build asks for <name>
 meson_min() {
@@ -122,11 +171,11 @@ if ! rust_ok; then
         if apt_has rustup; then
             sudo apt-get install -y rustup
         else
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --default-toolchain none
         fi
     fi
     rustup toolchain list | grep -q '^stable' || rustup toolchain install stable
-    rustup default stable >/dev/null
+    export RUSTUP_TOOLCHAIN=stable
     hash -r
     rust_ok || die "Rust is still older than $cargo_rust_min"
 fi
@@ -193,13 +242,7 @@ else
     done
     sudo apt-get install -y --no-install-recommends "${ff_deps[@]}"
 
-    # A checkout of another branch is ours to replace.
-    if [[ -d $SRC/ffmpeg/.git ]] &&
-       [[ $(git -C "$SRC/ffmpeg" rev-parse --abbrev-ref HEAD 2>/dev/null) != "$FFMPEG_BRANCH" ]]; then
-        rm -rf "$SRC/ffmpeg" 2>/dev/null || sudo rm -rf "$SRC/ffmpeg"
-    fi
-    [[ -d $SRC/ffmpeg/.git ]] ||
-        git clone --depth 1 --branch "$FFMPEG_BRANCH" "$FFMPEG_REPO" "$SRC/ffmpeg"
+    checkout_source "$SRC/ffmpeg" "$FFMPEG_REPO" "$FFMPEG_BRANCH"
 
     codecs=()
     pkg-config --exists x264      && codecs+=(--enable-libx264)
@@ -208,9 +251,9 @@ else
     pkg-config --exists aom       && codecs+=(--enable-libaom)
     pkg-config --exists SvtAv1Enc && codecs+=(--enable-libsvtav1)
 
-    cd "$SRC/ffmpeg"
-    make distclean >/dev/null 2>&1 || true
-    ./configure \
+    prepare_build_dir "$SRC/ffmpeg-build" "$FFMPEG_REPO"
+    cd "$SRC/ffmpeg-build"
+    "$SRC/ffmpeg/configure" \
         --prefix="$FFMPEG_PREFIX" \
         --enable-shared --disable-static \
         --disable-programs --disable-doc \
@@ -222,7 +265,6 @@ else
     # Replace, don't layer: a new major would otherwise leave stale sonames.
     [[ $FFMPEG_PREFIX == /opt/* && -d $FFMPEG_PREFIX ]] && sudo rm -rf "$FFMPEG_PREFIX"
     sudo make install
-    own_tree "$SRC/ffmpeg"
     printf 'branch=%s\ncommit=%s\n' "$FFMPEG_BRANCH" "$(git rev-parse --short HEAD)" |
         sudo tee "$FFMPEG_PREFIX/.build-info" >/dev/null
     ffmpeg_ok "$FFMPEG_PREFIX/lib/pkgconfig" ||
@@ -244,18 +286,17 @@ avcodec_major=$(pkg-config --modversion libavcodec | cut -d. -f1)
 log "Building waypipe $WAYPIPE_VER"
 cd "$SRC/waypipe"
 cargo fetch --locked
-if [[ -d build ]]; then rm -rf build 2>/dev/null || sudo rm -rf build; fi
-meson setup build \
+prepare_build_dir "$SRC/waypipe-build" "$WAYPIPE_REPO"
+meson setup "$SRC/waypipe-build" \
     --buildtype=release \
     -Dprefix="$PREFIX" \
     -Dbuild_rs=true -Dbuild_c=false -Dtests=false \
     -Dwith_dmabuf=enabled -Dwith_video=enabled \
     -Dwith_lz4=enabled -Dwith_zstd=enabled -Dwith_gbm=enabled \
     -Dman-pages=auto
-ninja -C build
+ninja -C "$SRC/waypipe-build"
 # --no-rebuild: root has no Rust toolchain, so installing must not run cargo.
-sudo meson install -C build --no-rebuild
-own_tree build
+sudo meson install -C "$SRC/waypipe-build" --no-rebuild
 hash -r
 
 # ---------------------------------------------------------------- 6. verify ---
@@ -288,8 +329,13 @@ Try it:
   waypipe --compress zstd ssh <host> <command>
 
 To uninstall:
-  sudo ninja -C $SRC/waypipe/build uninstall
+  sudo ninja -C $SRC/waypipe-build uninstall
 EOF
 if (( use_private )); then
     echo "  sudo rm -rf $FFMPEG_PREFIX /etc/ld.so.conf.d/ffmpeg-waypipe.conf && sudo ldconfig"
+fi
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
 fi
