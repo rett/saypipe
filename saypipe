@@ -75,7 +75,9 @@ LINKS_MADE=0          # a link was created (for the PATH note)
 # available, else realpath, else a manual walk).
 resolve() {
     local p=$1 d l n=0
-    if readlink -f -- / >/dev/null 2>&1; then readlink -f -- "$p"; return; fi
+    if readlink -f -- / >/dev/null 2>&1; then
+        readlink -f -- "$p" 2>/dev/null && return
+    fi
     if command -v realpath >/dev/null 2>&1; then realpath -- "$p" 2>/dev/null && return; fi
     while [ -L "$p" ] && [ $n -lt 40 ]; do
         l=$(readlink -- "$p") || break

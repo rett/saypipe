@@ -19,6 +19,7 @@ test: doctor
 	bash tests/launch-session.sh
 	bash tests/launch-errors.sh
 	bash tests/config.sh
+	bash tests/resolve.sh
 	bash tests/probe.sh
 	bash tests/diagnostics.sh
 	bash tests/audio-forward.sh
