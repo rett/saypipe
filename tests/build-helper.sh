@@ -96,11 +96,14 @@ sudo() {
     case $1 in
         ldconfig) [[ $fail_at != ldconfig ]]; return ;;
         chown) return 0 ;;
-        cp) [[ $fail_at != copy ]] || return 1 ;;
+        cp)
+            printf 'copy-mode=%s\n' "$(stat -c %a "${@: -1}")" >> "$sudo_log"
+            [[ $fail_at != copy ]] || return 1
+            ;;
         mv)
             if [[ $fail_at == activate && $3 == *.new.* ]]; then return 1; fi
             ;;
-        mkdir|mktemp|rmdir|rm|tee) ;;
+        mkdir|mktemp|rmdir|rm|tee|chmod) ;;
         *) echo "unexpected privileged command: $*" >&2; return 99 ;;
     esac
     # Refuse any accidental privileged operation outside the test fixtures.
@@ -119,6 +122,7 @@ stage=$tmp/staged
 mkdir -p "$stage/lib/pkgconfig"
 printf 'saypipe-build-ffmpeg-v1\n' > "$stage/.build-info"
 printf 'new\n' > "$stage/version"
+chmod 700 "$stage"
 FFMPEG_PREFIX=$tmp/installed
 mkdir "$FFMPEG_PREFIX"
 printf 'saypipe-build-ffmpeg-v1\n' > "$FFMPEG_PREFIX/.build-info"
@@ -148,6 +152,12 @@ grep -q -- "--define-variable=prefix=$stage" "$pkg_log"
 grep -q "^|$stage/lib/pkgconfig|" "$pkg_log"
 transaction success
 test "$(cat "$FFMPEG_PREFIX/version")" = new
+test "$(stat -c %a "$FFMPEG_PREFIX")" = 755
+grep -q 'copy-mode=755' "$sudo_log"
+if grep -q 'copy-mode=700' "$sudo_log"; then
+    echo 'pending prefix inaccessible before copy' >&2
+    exit 1
+fi
 test "$(cat "$linker_fixture")" = "$FFMPEG_PREFIX/lib"
 [[ -z $(find "$tmp" -maxdepth 1 -name 'installed.old.*' -print) ]]
 

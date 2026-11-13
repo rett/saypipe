@@ -158,10 +158,14 @@ install_staged_ffmpeg() {
     prefix_owned "$staged" || { warn "unowned staged FFmpeg: $staged"; return 1; }
     ffmpeg_ok "$staged/lib/pkgconfig" "$staged" || return 1
     ffmpeg_pending=$(sudo mktemp -d "$FFMPEG_PREFIX.new.XXXXXX") || return 1
+    # mktemp creates a root-only directory. Ownership checks and the runtime
+    # linker need to traverse it as the invoking user, including after failure.
+    sudo chmod 755 -- "$ffmpeg_pending" || return 1
     # Record ownership before copying, so a partial copy can be cleaned up.
     printf 'saypipe-build-ffmpeg-v1\n' | sudo tee "$ffmpeg_pending/.build-info" >/dev/null || return 1
     sudo cp -a -- "$staged/." "$ffmpeg_pending/" || return 1
     sudo chown -R root:root -- "$ffmpeg_pending" || return 1
+    sudo chmod -R a+rX -- "$ffmpeg_pending" || return 1
     if [[ -e $FFMPEG_PREFIX ]]; then
         ffmpeg_backup=$(sudo mktemp -d "$FFMPEG_PREFIX.old.XXXXXX") || return 1
         sudo rmdir -- "$ffmpeg_backup" || return 1
