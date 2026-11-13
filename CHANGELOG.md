@@ -6,6 +6,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-11-13
+
 ### Fixed
 
 - Fall back to portable path resolution when readlink cannot canonicalize a new configuration file, preserve cyclic symlinks instead of replacing them, and use FreeBSD’s base tcsh in CI.
