@@ -56,6 +56,29 @@ as_root() {
     fi
 }
 
+# Stage copies in an exclusively created directory. Moving the completed file
+# replaces an owned symlink without writing through it into another checkout.
+copy_tmp=''
+cleanup_copy() {
+    [ -z "$copy_tmp" ] || as_root rm -rf -- "$copy_tmp"
+    copy_tmp=''
+}
+install_copy() {
+    _copy_dir=$2.new.$$
+    as_root mkdir -m 0700 -- "$_copy_dir" || die "cannot stage $2"
+    copy_tmp=$_copy_dir
+    trap cleanup_copy 0
+    trap 'exit 1' HUP INT TERM
+    if as_root cp "$1" "$copy_tmp/file" &&
+       as_root chmod "$3" "$copy_tmp/file" &&
+       as_root mv -f "$copy_tmp/file" "$2"; then
+        cleanup_copy
+    else
+        cleanup_copy
+        die "failed to install $2"
+    fi
+}
+
 # resolve <path>: absolute path with symlinks resolved, without relying on
 # GNU readlink -f. (POSIX sh has no local variables, hence the _r prefix.)
 resolve() {
@@ -191,18 +214,24 @@ is_our_completion() {
 
 install_completions() {
     [ -d "$SRC_DIR/completions" ] || { warn "completions/ not found; skipping shell completion"; return 0; }
-    completion_dests | while read -r src dst; do
+    destinations=$(completion_dests) || die "cannot determine completion destinations"
+    while read -r src dst; do
         [ -f "$SRC_DIR/completions/$src" ] || continue
         if { [ -e "$dst" ] || [ -L "$dst" ]; } && ! is_our_completion "$dst"; then
             warn "$dst exists and is not saypipe's; not replacing it"; continue
         fi
         if [ "$MODE" = user ]; then
-            mkdir -p "${dst%/*}" && ln -sf -- "$(resolve "$SRC_DIR/completions/$src")" "$dst"
+            mkdir -p "${dst%/*}" || die "cannot create completion directory ${dst%/*}"
+            ln -sf -- "$(resolve "$SRC_DIR/completions/$src")" "$dst" ||
+                die "failed to install completion $dst"
         else
-            as_root mkdir -p "${dst%/*}" && as_root cp "$SRC_DIR/completions/$src" "$dst" &&
-                as_root chmod 0644 "$dst"
-        fi && log "Installed completion: $dst"
-    done
+            as_root mkdir -p "${dst%/*}" || die "cannot create completion directory ${dst%/*}"
+            install_copy "$SRC_DIR/completions/$src" "$dst" 0644
+        fi
+        log "Installed completion: $dst"
+    done <<EOF
+$destinations
+EOF
     if [ "$MODE" = user ] && have zsh; then
         echo "    zsh: if completion doesn't load, add this to ~/.zshrc before compinit:"
         echo "      fpath=(${XDG_DATA_HOME:-~/.local/share}/zsh/site-functions \$fpath)"
@@ -210,18 +239,24 @@ install_completions() {
 }
 
 uninstall_completions() {
-    {
+    destinations=$({
         completion_dests
         # the fish location depends on the fish installed; check both
         [ "$MODE" = user ] || printf '%s\n' \
-            "saypipe.fish ${PREFIX:-/usr/local}/share/fish/vendor_completions.d/saypipe.fish" \
-            "saypipe.fish /etc/fish/completions/saypipe.fish"
-    } | sort -u | while read -r src dst; do
-        if is_our_completion "$dst"; then
-            if [ "$MODE" = user ]; then rm -f -- "$dst"; else as_root rm -f -- "$dst"; fi &&
-                log "Removed completion: $dst"
+            "saypipe.fish ${PREFIX:-/usr/local}/share/fish/vendor_completions.d/saypipe.fish"
+        if [ "$MODE" != user ] && [ "${PREFIX:-/usr/local}" = /usr/local ]; then
+            printf '%s\n' "saypipe.fish /etc/fish/completions/saypipe.fish"
         fi
-    done
+    }) || die "cannot determine completion destinations"
+    while read -r src dst; do
+        if is_our_completion "$dst"; then
+            if [ "$MODE" = user ]; then rm -f -- "$dst"; else as_root rm -f -- "$dst"; fi ||
+                die "failed to remove completion $dst"
+            log "Removed completion: $dst"
+        fi
+    done <<EOF
+$destinations
+EOF
 }
 
 do_install() {
@@ -238,9 +273,11 @@ do_install() {
             log "Already linked: $DEST -> $target"
         elif [ -e "$DEST" ] || [ -L "$DEST" ]; then
             is_saypipe "$DEST" || die "$DEST exists and is not saypipe; not replacing it"
-            ln -sf -- "$target" "$DEST" && log "Linked $DEST -> $target (replaced the old one)"
+            ln -sf -- "$target" "$DEST" || die "failed to link $DEST"
+            log "Linked $DEST -> $target (replaced the old one)"
         else
-            ln -s -- "$target" "$DEST" && log "Linked $DEST -> $target"
+            ln -s -- "$target" "$DEST" || die "failed to link $DEST"
+            log "Linked $DEST -> $target"
         fi
     else
         if { [ -e "$DEST" ] || [ -L "$DEST" ]; } && ! is_saypipe "$DEST"; then
@@ -248,9 +285,7 @@ do_install() {
         fi
         log "Installing $DEST"
         as_root mkdir -p "${DEST%/*}"
-        as_root cp "$SRC" "$DEST.new.$$"
-        as_root chmod 0755 "$DEST.new.$$"
-        as_root mv -f "$DEST.new.$$" "$DEST"
+        install_copy "$SRC" "$DEST" 0755
     fi
     "$DEST" --help >/dev/null 2>&1 || die "$DEST does not run"
     install_completions
@@ -277,6 +312,7 @@ do_uninstall() {
 
         if [ "$PURGE" = 1 ]; then
             # Close saypipe's shared connections before their config goes.
+            # shellcheck disable=SC2013 # host entries are whitespace-separated
             for h in $(sed -e 's/#.*//' "${XDG_CONFIG_HOME:-$home/.config}/saypipe/share-hosts" 2>/dev/null); do
                 "$DEST" --share-exit "$h" || true
             done

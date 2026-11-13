@@ -12,8 +12,9 @@ export XDG_CONFIG_HOME=$TEST_ROOT/config XDG_STATE_HOME=$TEST_ROOT/state
 export XDG_DATA_HOME=$TEST_ROOT/data XDG_RUNTIME_DIR=$TEST_ROOT/runtime
 export TMPDIR=$TEST_ROOT/tmp SAYPIPE_BIN_DIR=$TEST_ROOT/bin
 export PREFIX=$TEST_ROOT/prefix
-export TEST_CALLS=$TEST_ROOT/calls REAL_BASH
-mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" "$TEST_ROOT/tools" "$TEST_ROOT/source"
+export TEST_CALLS=$TEST_ROOT/calls REAL_BASH TEST_ROOT
+export TEST_REAL_TOOLS=$TEST_ROOT/real-tools
+mkdir -p "$HOME" "$XDG_RUNTIME_DIR" "$TMPDIR" "$TEST_ROOT/tools" "$TEST_ROOT/source" "$TEST_REAL_TOOLS"
 chmod 700 "$XDG_RUNTIME_DIR"
 cp "$ROOT/install.sh" "$ROOT/saypipe" "$TEST_ROOT/source/"
 cp -R "$ROOT/completions" "$TEST_ROOT/source/"
@@ -57,6 +58,35 @@ done
 for command in id bash ssh waypipe fish sudo doas apt-get dnf yum zypper pacman apk xbps-install emerge pkg; do
     chmod +x "$TEST_ROOT/tools/$command"
 done
+# Reject mutations outside the fixture even if an installer regression restores
+# the /etc fallback for a custom PREFIX. Keep real utilities out of PATH.
+for command in mkdir ln cp chmod mv rm; do
+    executable=$(command -v "$command")
+    ln -s "$executable" "$TEST_REAL_TOOLS/$command"
+    rm "$TEST_ROOT/tools/$command"
+    cat > "$TEST_ROOT/tools/$command" <<'EOF'
+#!/bin/sh
+for argument do
+    case $argument in
+        /*) case $argument in "$TEST_ROOT"|"$TEST_ROOT"/*) ;; *)
+            printf 'refused mutation outside fixture: %s\n' "$argument" >&2
+            exit 98 ;;
+        esac ;;
+    esac
+done
+case ${0##*/} in
+    cp) failure=${TEST_FAIL_PATH:-} ;;
+    rm) failure=${TEST_FAIL_REMOVE:-} ;;
+    ln) failure=${TEST_FAIL_LINK:-} ;;
+    *) failure='' ;;
+esac
+if [ -n "$failure" ]; then
+    case "$*" in *"$failure"*) exit 42 ;; esac
+fi
+exec "$TEST_REAL_TOOLS/${0##*/}" "$@"
+EOF
+    chmod +x "$TEST_ROOT/tools/$command"
+done
 export PATH=$TEST_ROOT/tools
 
 fail() { printf 'FAIL installer: %s\n' "$*" >&2; exit 1; }
@@ -96,6 +126,22 @@ run
 run --uninstall
 [[ ! -e $PREFIX/bin/saypipe ]] || fail 'copied uninstall left launcher'
 
+mkdir -p "$SAYPIPE_BIN_DIR"
+printf 'unrelated\n' > "$SAYPIPE_BIN_DIR/saypipe"
+reject --user
+contains 'not replacing'
+reject --user --uninstall
+contains 'not removing'
+[[ $(cat "$SAYPIPE_BIN_DIR/saypipe") == unrelated ]] || fail 'unrelated user launcher changed'
+rm "$SAYPIPE_BIN_DIR/saypipe"
+cp "$TEST_ROOT/source/saypipe" "$SAYPIPE_BIN_DIR/saypipe"
+TEST_FAIL_LINK=$SAYPIPE_BIN_DIR/saypipe reject --user
+contains 'failed to link'
+[[ ! -L $SAYPIPE_BIN_DIR/saypipe ]] || fail 'failed link changed copied launcher'
+run --user
+[[ -L $SAYPIPE_BIN_DIR/saypipe ]] || fail 'user install did not replace owned copied launcher'
+run --user --uninstall
+
 # A preexisting unrelated launcher and dangling system destination are protected.
 printf 'unrelated\n' > "$PREFIX/bin/saypipe"
 reject
@@ -110,9 +156,66 @@ contains 'not overwriting'
 [[ -L $PREFIX/bin/saypipe ]] || fail 'dangling destination was replaced'
 rm "$PREFIX/bin/saypipe"
 
+# Completion installation and removal errors must survive later destinations.
+# Failure injection works for root as well as an ordinary user.
+TEST_FAIL_PATH=completions/saypipe.bash reject
+contains 'failed to install'
+if grep -q '^Done\.' "$TEST_ROOT/output"; then fail 'completion failure claimed success'; fi
+for leftover in "$PREFIX/share/bash-completion/completions/saypipe.new."*; do
+    [[ ! -e $leftover ]] || fail 'failed copy left staging directory'
+done
+run
+old_launcher=$(cat "$PREFIX/bin/saypipe")
+TEST_FAIL_PATH=source/saypipe reject
+contains 'failed to install'
+[[ $(cat "$PREFIX/bin/saypipe") == "$old_launcher" ]] || fail 'failed copy replaced launcher'
+TEST_FAIL_REMOVE=bash-completion/completions/saypipe reject --uninstall
+contains 'failed to remove completion'
+run --uninstall
+
+# Copying over an owned completion symlink must leave its old target intact.
+mkdir -p "$PREFIX/share/bash-completion/completions"
+printf '# completion for saypipe\nsentinel\n' > "$TEST_ROOT/old-completion"
+ln -s "$TEST_ROOT/old-completion" "$PREFIX/share/bash-completion/completions/saypipe"
+run
+[[ ! -L $PREFIX/share/bash-completion/completions/saypipe ]] || fail 'completion copy followed symlink'
+grep -q '^sentinel$' "$TEST_ROOT/old-completion" || fail 'completion target overwritten'
+run --uninstall
+
+# Preserve unrelated completion files in both layouts.
+printf 'unrelated\n' > "$PREFIX/share/bash-completion/completions/saypipe"
+run
+run --uninstall
+[[ $(cat "$PREFIX/share/bash-completion/completions/saypipe") == unrelated ]] || fail 'unrelated system completion changed'
+mkdir -p "$XDG_DATA_HOME/bash-completion/completions"
+printf 'unrelated\n' > "$XDG_DATA_HOME/bash-completion/completions/saypipe"
+run --user
+run --user --uninstall
+[[ $(cat "$XDG_DATA_HOME/bash-completion/completions/saypipe") == unrelated ]] || fail 'unrelated user completion changed'
+rm "$XDG_DATA_HOME/bash-completion/completions/saypipe"
+
+# The linked checkout can disappear before uninstall, including completions.
+run --user
+mv "$TEST_ROOT/source/saypipe" "$TEST_ROOT/source/saved-launcher"
+mv "$TEST_ROOT/source/completions" "$TEST_ROOT/source/saved-completions"
+run --user --uninstall
+[[ ! -L $SAYPIPE_BIN_DIR/saypipe && ! -L $XDG_CONFIG_HOME/fish/completions/saypipe.fish ]] || fail 'dangling owned links remain'
+mv "$TEST_ROOT/source/saved-launcher" "$TEST_ROOT/source/saypipe"
+mv "$TEST_ROOT/source/saved-completions" "$TEST_ROOT/source/completions"
+
+# Purge dispatches only through the fake ssh and removes fixture-owned paths.
+run --user
+mkdir -p "$XDG_CONFIG_HOME/saypipe" "$XDG_STATE_HOME/saypipe"
+printf 'example-host\n' > "$XDG_CONFIG_HOME/saypipe/share-hosts"
+run --user --uninstall --purge
+[[ ! -e $XDG_CONFIG_HOME/saypipe && ! -e $XDG_STATE_HOME/saypipe ]] || fail 'active purge left config/state'
+grep -q '^ssh$' "$TEST_CALLS" || fail 'purge did not attempt shared-connection cleanup'
+: > "$TEST_CALLS"
+
 # The default system prefix still supports fish's system fallback. Inspect the
 # destination generator without executing an install into any system directory.
 sed '/^MODE=system ACTION=install PURGE=0/,$d' "$TEST_ROOT/source/install.sh" > "$TEST_ROOT/destinations.sh"
+# shellcheck disable=SC2016 # evaluated by the isolated child shell
 env PREFIX=/usr/local sh -c '. "$1"; MODE=system; completion_dests' sh "$TEST_ROOT/destinations.sh" > "$TEST_ROOT/destinations"
 grep -q '^saypipe.fish /etc/fish/completions/saypipe.fish$' "$TEST_ROOT/destinations" || fail 'default fish fallback changed'
 [[ $(cat "$TEST_CALLS") == fish ]] || fail 'unexpected dependency or privilege command ran'
