@@ -42,6 +42,12 @@ usage() { sed -n "/^# install.sh:/,/^$/s/^# \{0,1\}//p" "$0"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+check_bash() {
+    have bash || die "bash 4.4 or newer is required but still not installed"
+    bash -c '[ "${BASH_VERSINFO[0]}" -gt 4 ] || { [ "${BASH_VERSINFO[0]}" -eq 4 ] && [ "${BASH_VERSINFO[1]}" -ge 4 ]; }' ||
+        die "bash on PATH must be version 4.4 or newer"
+}
+
 as_root() {
     if [ "$(id -u)" -eq 0 ]; then "$@"
     elif have sudo; then sudo "$@"
@@ -165,7 +171,8 @@ completion_dests() {
         # Some fish builds (e.g. Debian's) don't search /usr/local/share;
         # every fish searches /etc/fish/completions.
         _cf=$_cd/fish/vendor_completions.d
-        if have fish && ! fish -c "contains -- $_cf \$fish_complete_path" >/dev/null 2>&1; then
+        if [ "${PREFIX:-/usr/local}" = /usr/local ] && have fish &&
+           ! fish -c "contains -- $_cf \$fish_complete_path" >/dev/null 2>&1; then
             _cf=/etc/fish/completions
         fi
         echo "saypipe.fish $_cf/saypipe.fish"
@@ -220,7 +227,8 @@ uninstall_completions() {
 do_install() {
     [ -f "$SRC" ] || die "saypipe not found next to install.sh ($SRC_DIR)"
     install_packages
-    have bash || die "bash is required but still not installed"
+    check_bash
+    have ssh || die "ssh is required but still not installed"
     have waypipe || warn "waypipe is not installed; saypipe needs it to launch apps"
 
     if [ "$MODE" = user ]; then
@@ -235,7 +243,7 @@ do_install() {
             ln -s -- "$target" "$DEST" && log "Linked $DEST -> $target"
         fi
     else
-        if [ -e "$DEST" ] && ! is_saypipe "$DEST"; then
+        if { [ -e "$DEST" ] || [ -L "$DEST" ]; } && ! is_saypipe "$DEST"; then
             die "$DEST exists and is not saypipe; not overwriting it"
         fi
         log "Installing $DEST"
