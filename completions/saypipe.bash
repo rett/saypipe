@@ -24,6 +24,8 @@ _saypipe() {
     # flags already on the line aren't offered again
     local have=" ${words[*]:2:cword-2} "
     case ${words[1]} in
+        --foreground|--verbose)
+            [ "$cword" -eq 2 ] && kind=hosts ;;
         --host-add|--gpu-add|--audio-add|--share-add|--link-add)
             kind=hosts; [[ $have == *" --force "* ]] || extra=--force ;;
         --probe)

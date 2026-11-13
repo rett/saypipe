@@ -49,6 +49,10 @@ _saypipe() {
         '--link-add:make hosts commands'
         '--link-remove:remove host links'
         '--completion-hosts:complete all hosts or only enabled ones'
+        '--foreground:stay attached and stream output'
+        '--verbose:stay attached and stream output'
+        '--doctor:inspect local tools and display'
+        '--version:show installed version'
         '--help:show usage'
     )
 
@@ -64,6 +68,7 @@ _saypipe() {
     # arguments so far, without flags
     rest=(${words[3,CURRENT-1]:#--(force|global|apply)})
     case $words[2] in
+        --foreground|--verbose) (( CURRENT == 3 )) && __saypipe_hosts ;;
         --host-add|--gpu-add|--audio-add|--share-add|--link-add)
             __saypipe_flag --force; __saypipe_hosts ;;
         --probe)          __saypipe_flag --apply; __saypipe_hosts ;;
