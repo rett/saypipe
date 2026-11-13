@@ -40,8 +40,8 @@ exec "$@"
 MOCK
 chmod +x "$TEST_REMOTE_BIN/dbus-run-session"
 
-"$project_dir/saypipe" --run testhost 'printf "%s" "$DBUS_SESSION_BUS_ADDRESS" > "$TEST_OUTPUT"'
-[ "$(cat "$TEST_OUTPUT")" = unix:path=/private-test-bus ]
+WAYLAND_DISPLAY=wayland-launch-test "$project_dir/saypipe" --run testhost 'printf "%s|%s" "$DBUS_SESSION_BUS_ADDRESS" "$WAYLAND_DISPLAY" > "$TEST_OUTPUT"'
+[ "$(cat "$TEST_OUTPUT")" = "unix:path=/private-test-bus|wayland-launch-test" ]
 
 # Quotes, metacharacters, a pipeline and newlines stay inside the private bus.
 "$project_dir/saypipe" --run testhost "printf '%s\\n' \"a'b \\\$x; literal\" | { read -r value; printf '%s' \"\$value\" > \"\$TEST_OUTPUT\"; }"
