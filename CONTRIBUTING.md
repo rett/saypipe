@@ -24,3 +24,16 @@ Run `make bootstrap` to check development tools and `make doctor` to diagnose mi
 
 - Every user-visible change gets a changelog entry under `[Unreleased]`, in the same commit as the change.
 - One logical change per commit; no private names (hosts, users, home paths) in files or commit messages.
+
+## Version and portability checks
+
+A release updates VERSION and the embedded VERSION assignment in saypipe in
+one commit. The embedded value makes --version work in standalone copied
+installations. The diagnostics test checks that both values agree.
+
+The test suite isolates user state and substitutes SSH, privilege helpers and
+package managers. It checks configuration concurrency, launch failures, audio
+forwarding arguments and cleanup, diagnostics, and installer/build decisions.
+Real remote audio, GPU and portal behavior needs a suitable host. The apt-only
+source-build safety checks run on Linux. CI also runs the launcher and installer
+checks on Bash 4.4, Alpine and FreeBSD, with fish/tcsh login shells where installed.

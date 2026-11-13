@@ -1,4 +1,4 @@
-.PHONY: bootstrap doctor test
+.PHONY: bootstrap doctor test lint
 
 # Development checks need no downloaded dependencies or application installation.
 bootstrap: doctor
@@ -17,5 +17,15 @@ test: doctor
 	bash -n scripts/build-waypipe.sh
 	bash -n completions/saypipe.bash
 	bash tests/launch-session.sh
+	bash tests/launch-errors.sh
+	bash tests/config.sh
+	bash tests/probe.sh
+	bash tests/diagnostics.sh
+	bash tests/audio-forward.sh
+	bash tests/install.sh
+	@if [ "$$(uname -s)" = Linux ]; then bash tests/build-helper.sh; else echo "skip: apt-only build helper checks"; fi
 	@if command -v zsh >/dev/null; then zsh -n completions/_saypipe; else echo "skip: zsh completion syntax (zsh unavailable)"; fi
 	@if command -v fish >/dev/null; then fish -n completions/saypipe.fish; else echo "skip: fish completion syntax (fish unavailable)"; fi
+
+lint:
+	shellcheck --severity=error saypipe install.sh scripts/build-waypipe.sh completions/saypipe.bash tests/*.sh

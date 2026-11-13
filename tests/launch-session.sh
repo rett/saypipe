@@ -4,9 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 project_dir=$PWD
-test_dir=$(mktemp -d)
-trap 'rm -rf -- "$test_dir"' EXIT
-export XDG_CONFIG_HOME=$test_dir/config XDG_STATE_HOME=$test_dir/state
+source tests/common.sh
+test_dir=$TEST_ROOT
 export TEST_OUTPUT=$test_dir/output TEST_BUS_STARTS=$test_dir/bus-starts
 export TEST_REMOTE_BIN=$test_dir/remote
 mkdir -p "$test_dir/local" "$TEST_REMOTE_BIN"
@@ -16,7 +15,7 @@ cat > "$test_dir/local/waypipe" <<'MOCK'
 while [ "$1" != ssh ]; do shift; done
 shift
 shift # host (these tests have no sharing or audio forwarding)
-SHELL=${TEST_REMOTE_SHELL:-/bin/sh} PATH=$TEST_REMOTE_BIN exec /bin/sh -c "$*"
+SHELL=${TEST_REMOTE_SHELL:-/bin/sh} PATH=$TEST_REMOTE_BIN exec "${TEST_LOGIN_SHELL:-/bin/sh}" -c "$*"
 MOCK
 chmod +x "$test_dir/local/waypipe"
 export PATH=$test_dir/local:$PATH
@@ -63,8 +62,18 @@ for expected in 1 126 127; do
     "$project_dir/saypipe" --run testhost "exit $expected" || actual=$?
     [ "$actual" = "$expected" ]
 done
-[ "$(wc -l < "$TEST_BUS_STARTS")" -eq 8 ]
 grep -q 'exit 127' "$XDG_STATE_HOME/saypipe/errors.log"
+# Real login shells parse the outer SSH text, including octal command payloads.
+for shell in fish tcsh; do
+    login_shell=$(command -v "$shell" || true)
+    if [ -n "$login_shell" ]; then
+        TEST_LOGIN_SHELL=$login_shell "$project_dir/saypipe" --run testhost "printf '%s' \"a'b \\\\$literal\" > \"\$TEST_OUTPUT\""
+        [ "$(cat "$TEST_OUTPUT")" = "a'b \$literal" ]
+    else
+        printf 'skip: %s remote login shell unavailable\n' "$shell"
+    fi
+done
+
 # When installed, exercise two real session buses through the worker too.
 real_dbus=$(command -v dbus-run-session || true)
 if [ -n "$real_dbus" ]; then

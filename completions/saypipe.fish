@@ -56,6 +56,11 @@ complete -c saypipe -n __saypipe_first -l alias-remove -d 'remove aliases and th
 complete -c saypipe -n __saypipe_first -l link-add -d 'make hosts commands'
 complete -c saypipe -n __saypipe_first -l link-remove -d 'remove host links'
 complete -c saypipe -n __saypipe_first -l completion-hosts -d 'complete all hosts or only enabled ones'
+complete -c saypipe -n __saypipe_first -l foreground -d 'stay attached and stream output'
+complete -c saypipe -n __saypipe_first -l verbose -d 'stay attached and stream output'
+complete -c saypipe -n __saypipe_first -l doctor -d 'inspect local tools and display'
+complete -c saypipe -n __saypipe_first -l version -d 'show installed version'
+complete -c saypipe -n '__saypipe_args --foreground 0; or __saypipe_args --verbose 0' -k -a '(__saypipe_list hosts)' -d host
 complete -c saypipe -n __saypipe_first -s h -l help -d 'show usage'
 
 # Arguments of the options.

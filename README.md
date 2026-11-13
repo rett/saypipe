@@ -59,6 +59,59 @@ also builds a private ffmpeg in `/opt/ffmpeg-waypipe` if the system's is too
 old for waypipe's video support. Rerun it to update. It needs sudo and takes
 a while.
 
+The source-build helper now reuses only recognized, clean upstream checkouts.
+It refuses dirty or unfamiliar source trees and uses separate `waypipe-build`
+and `ffmpeg-build` directories carrying ownership markers. It stages private
+FFmpeg as the invoking user before replacing a verified owned prefix, and
+retains the previous prefix through verification for rollback.
+
+Existing private FFmpeg installations from older helper versions lack the new
+ownership header in `.build-info` and are deliberately refused. Back up and
+inspect that installation before moving it aside or selecting a new private
+`FFMPEG_PREFIX`. Do not add the ownership header to an unfamiliar directory.
+An interrupted build may leave a `.saypipe-lock`, `.new.*` or `.old.*` sibling
+that needs inspection. Linker registration remains system-wide, and waypipe's
+own installation is outside the FFmpeg rollback transaction.
+
+## Troubleshooting
+
+```
+saypipe --version                   # identify the installed copy
+saypipe --doctor                    # local tools, display and config health
+saypipe --probe myvm                 # remote capabilities and portal availability
+saypipe --foreground myvm foot       # stream output and wait for the app
+```
+
+`--verbose` is an alias for `--foreground`. Both precede the host. Host links
+can use `SAYPIPE_FOREGROUND=1 myvm foot`. Detached launches remain the default.
+The launcher confirms its worker started before reporting success.
+
+`--doctor` is local and read-only. `--probe` authenticates over SSH and reports
+the remote shell, D-Bus session helper and portal files without activating
+portal services. Availability does not prove that a file dialog will open.
+Post-authentication probe commands have a 15-second limit, configurable with
+`SAYPIPE_PROBE_TIMEOUT`. SSH's authentication step can still prompt normally.
+
+Session output is kept in a private temporary directory, capped at 64 KiB
+(configurable with `SAYPIPE_LOG_BYTES`, between 4 KiB and 1 MiB). Unexpected
+exits are recorded in the private `errors.log`, which retains a bounded tail.
+An exit of 1 during the first five seconds, or with a recognizable error
+message, counts as a failure. A quiet exit of 1 after that window may be a
+normal GUI close and is omitted. `SAYPIPE_STARTUP_WINDOW` changes that window.
+The original exit status is preserved in foreground mode.
+
+Configuration updates are serialized and replaced atomically beside their
+resolved targets. Intentional symlinks and existing permissions are preserved.
+A writable target in a directory that forbids replacement is updated in place
+under the lock. Deliberately read-only files are refused. An interrupted writer's
+lock is recovered only when its recorded owner on this host is dead. A lock
+with an unknown or remote owner times out and is reported for inspection.
+
+When `user@host` inherits settings from `host`, removals require the exact
+saved entry. Saypipe reports the inherited entry instead of silently removing
+shared host settings. An exact default for `user@host` takes precedence over
+an inherited `host` default.
+
 ## Enabled hosts
 
 saypipe keeps a list of enabled hosts, the hosts it works with. A host is
@@ -238,6 +291,9 @@ Host options (adding one enables the host; --force works here too):
 
 Settings:
   --completion-hosts [all|enabled]
+  --foreground, --verbose           stream output and wait for the app
+  --doctor                          local tools, display and config health
+  --version                         installed version
   -h, --help
 ```
 
@@ -247,7 +303,8 @@ stderr, and exit 1 when something couldn't be done (2 for wrong arguments).
 Environment: `SAYPIPE_OPTS` (waypipe options for every host),
 `SAYPIPE_BIN_DIR` (links), `SAYPIPE_SHARE_PERSIST` (shared connection
 lifetime, default `10m`), `SAYPIPE_WAIT` (seconds to watch a launch for
-failure, default `2`).
+failure, default `2`), `SAYPIPE_FOREGROUND`, `SAYPIPE_STARTUP_WINDOW`,
+`SAYPIPE_LOG_BYTES` and `SAYPIPE_PROBE_TIMEOUT` (see Troubleshooting).
 
 ## Files
 

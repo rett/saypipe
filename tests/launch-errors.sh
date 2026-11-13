@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: MIT
+cd "$(dirname "$0")/.."
+source tests/common.sh
+app=$PWD/saypipe
+cat > "$SAYPIPE_BIN_DIR/waypipe" <<'MOCK'
+#!/bin/sh
+case $TEST_CASE in
+ early) printf 'fatal: startup failed\n' >&2; exit 3 ;;
+ delayed) sleep 0.4; printf 'fatal: transport failed\n' >&2; exit 1 ;;
+ close) sleep 2; exit 1 ;;
+ output) printf 'visible output\n'; exit 0 ;;
+ flood) dd if=/dev/zero bs=4096 count=64 2>/dev/null | tr '\000' x; exit 3 ;;
+ wait) exec sleep 30 ;;
+esac
+MOCK
+chmod +x "$SAYPIPE_BIN_DIR/waypipe"
+export TEST_CASE=early
+if "$app" --foreground demo app > "$TEST_ROOT/out" 2>&1; then exit 1; fi
+grep -q 'exit 3' "$XDG_STATE_HOME/saypipe/errors.log"
+export TEST_CASE=delayed
+SAYPIPE_WAIT=0 "$app" demo app
+sleep 1
+grep -q 'transport failed' "$XDG_STATE_HOME/saypipe/errors.log"
+export TEST_CASE=close
+before=$(wc -c < "$XDG_STATE_HOME/saypipe/errors.log")
+SAYPIPE_STARTUP_WINDOW=0 "$app" --run demo app && exit 1
+[ "$(wc -c < "$XDG_STATE_HOME/saypipe/errors.log")" -eq "$before" ]
+export TEST_CASE=output
+"$app" --foreground demo app > "$TEST_ROOT/out"
+grep -q 'visible output' "$TEST_ROOT/out"
+export TEST_CASE=flood
+SAYPIPE_LOG_BYTES=4096 "$app" --run demo app && exit 1
+[ "$(wc -c < "$XDG_STATE_HOME/saypipe/errors.log")" -lt 20000 ]
+export TEST_CASE=wait
+"$app" --run demo app & worker=$!
+sleep 0.3
+kill -TERM "$worker"
+wait "$worker" && exit 1
+[ -z "$(find "$TMPDIR" -name 'saypipe-session.*' -print)" ]
+printf 'launch error checks passed\n'
