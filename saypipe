@@ -40,7 +40,13 @@
 #
 # Needs bash (4.4 or newer), OpenSSH and waypipe; otherwise only POSIX tools.
 
+# Keep this guard parseable by Bash 3, before any newer syntax executes.
+if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 4) )); then
+    echo 'saypipe: Bash 4.4 or newer is required' >&2
+    exit 1
+fi
 set -u
+VERSION=0.0.2
 
 SELF=saypipe          # canonical name; any other name is treated as the host
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/saypipe"
@@ -52,7 +58,8 @@ ALIASES_FILE="$CONFIG_DIR/aliases"
 COMMANDS_FILE="$CONFIG_DIR/commands"
 HOSTS_FILE="$CONFIG_DIR/hosts"
 SETTINGS_FILE="$CONFIG_DIR/settings"
-SHARE_DIR="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/saypipe-$(id -u)}/saypipe/cm"
+SHARE_RUNTIME=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/saypipe-$(id -u)}
+SHARE_DIR="$SHARE_RUNTIME/saypipe/cm"
 ERROR_LOG="$STATE_DIR/errors.log"
 
 name=${0##*/}
@@ -92,6 +99,7 @@ usage_error() {
 # Host names become file names and ssh targets: keep them boring.
 valid_host() {
     case $1 in ""|-*|.|..|"$SELF") return 1 ;; esac
+    case $1 in @*|*@|*@*@*) return 1 ;; esac
     [[ $1 =~ ^[A-Za-z0-9._@-]+$ ]]
 }
 
@@ -118,7 +126,7 @@ list_file() {
 
 # list_entries <kind>: the host entries of that list, comments and blanks dropped.
 list_entries() {
-    local f l
+    local f l=''
     f=$(list_file "$1")
     [ -r "$f" ] || return 0
     while IFS= read -r l || [ -n "$l" ]; do
@@ -129,7 +137,7 @@ list_entries() {
 }
 
 # host_listed <kind> <host>: in that list? Matches the host as given or without
-# a user@ prefix (so "rett@myvm" matches a "myvm" line).
+# a user@ prefix (so "alice@myvm" matches a "myvm" line).
 host_listed() {
     local h=$2 bare=${2##*@} l
     while IFS= read -r l; do
@@ -154,22 +162,147 @@ setting_get() {
     printf '%s\n' "$2"
 }
 
-# setting_set <key> <value>: store a setting, replacing an old value
-# (rewritten in place, keeping permissions).
-setting_set() {
-    local l k v tmp
-    mkdir -p "${SETTINGS_FILE%/*}" || return 1
-    if [ ! -e "$SETTINGS_FILE" ]; then
-        printf '# saypipe settings: "<key> <value>" per line, # comments.\n' > "$SETTINGS_FILE" || return 1
+# Serialize configuration writers without requiring flock. Unknown or remote
+# lock owners are never removed automatically.
+CONFIG_LOCK_DEPTH=0
+CONFIG_LOCK_OWNER=
+CONFIG_LOCK_EXIT=
+CONFIG_LOCK_SIGNALS=
+CONFIG_EDIT_TMP=
+config_unlock() {
+    [ "$CONFIG_LOCK_DEPTH" -gt 0 ] || return 0
+    CONFIG_LOCK_DEPTH=$((CONFIG_LOCK_DEPTH - 1))
+    [ "$CONFIG_LOCK_DEPTH" -eq 0 ] || return 0
+    if [ "$(cat "$CONFIG_DIR/.lock/owner" 2>/dev/null)" = "$CONFIG_LOCK_OWNER" ]; then
+        rm -f -- "$CONFIG_DIR/.lock/owner"
+        rmdir -- "$CONFIG_DIR/.lock" 2>/dev/null || true
     fi
-    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-settings.XXXXXX") || return 1
-    while IFS= read -r l || [ -n "$l" ]; do
-        read -r k v <<< "${l%%#*}"
-        [ "${k:-}" = "$1" ] || printf '%s\n' "$l"
-    done < "$SETTINGS_FILE" > "$tmp"
-    printf '%s %s\n' "$1" "$2" >> "$tmp"
-    cat "$tmp" > "$SETTINGS_FILE"; rm -f -- "$tmp"
+    [ -z "$CONFIG_EDIT_TMP" ] || rm -f -- "$CONFIG_EDIT_TMP"
+    CONFIG_EDIT_TMP=
+    trap - EXIT INT TERM HUP
+    [ -z "$CONFIG_LOCK_EXIT" ] || eval "$CONFIG_LOCK_EXIT"
+    [ -z "$CONFIG_LOCK_SIGNALS" ] || eval "$CONFIG_LOCK_SIGNALS"
 }
+config_lock_exit() {
+    local previous=$CONFIG_LOCK_EXIT
+    CONFIG_LOCK_DEPTH=1
+    config_unlock
+    # Restoring an EXIT trap while already handling EXIT does not run it.
+    # Chain the previous handler explicitly, preserving its shell quoting.
+    trap - EXIT
+    if [ -n "$previous" ]; then
+        eval "set -- ${previous#trap -- }"
+        eval "$1"
+    fi
+}
+config_lock() {
+    if [ "$CONFIG_LOCK_DEPTH" -gt 0 ]; then
+        CONFIG_LOCK_DEPTH=$((CONFIG_LOCK_DEPTH + 1)); return 0
+    fi
+    mkdir -p "$CONFIG_DIR" || { die_soft "cannot create $CONFIG_DIR"; return 1; }
+    local owner machine pid lock_machine attempt=0
+    machine=$(uname -n)
+    while ! mkdir "$CONFIG_DIR/.lock" 2>/dev/null; do
+        owner=$(cat "$CONFIG_DIR/.lock/owner" 2>/dev/null) || owner=
+        read -r lock_machine pid <<< "$owner"
+        if [ "${lock_machine:-}" = "$machine" ] && [[ ${pid:-} =~ ^[0-9]+$ ]] &&
+           ! kill -0 "$pid" 2>/dev/null && ! ps -p "$pid" >/dev/null 2>&1; then
+            # One cleaner at a time; remove only the still-dead owner.
+            if mkdir "$CONFIG_DIR/.lock-recovery" 2>/dev/null; then
+                if [ "$(cat "$CONFIG_DIR/.lock/owner" 2>/dev/null)" = "$owner" ] &&
+                   ! kill -0 "$pid" 2>/dev/null && ! ps -p "$pid" >/dev/null 2>&1; then
+                    rm -f "$CONFIG_DIR/.lock/owner"
+                    rmdir "$CONFIG_DIR/.lock" 2>/dev/null || true
+                fi
+                rmdir "$CONFIG_DIR/.lock-recovery" 2>/dev/null || true
+            fi
+        fi
+        attempt=$((attempt + 1))
+        [ "$attempt" -lt 100 ] || { die_soft "timed out waiting for $CONFIG_DIR/.lock"; return 1; }
+        sleep 0.1 2>/dev/null || sleep 1
+    done
+    CONFIG_LOCK_OWNER="$machine $BASHPID"
+    if ! printf '%s\n' "$CONFIG_LOCK_OWNER" > "$CONFIG_DIR/.lock/owner"; then
+        rmdir "$CONFIG_DIR/.lock" 2>/dev/null || true
+        die_soft "cannot record configuration lock owner"; return 1
+    fi
+    CONFIG_LOCK_EXIT=$(trap -p EXIT)
+    CONFIG_LOCK_SIGNALS=$(trap -p INT TERM HUP)
+    CONFIG_LOCK_DEPTH=1
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    trap config_lock_exit EXIT
+}
+
+# config_edit FILE MODE KEY [VALUE]: replace a complete file while holding
+# the lock. Resolve intentional symlinks and preserve an existing file's mode.
+config_edit() {
+    local rc
+    config_lock || return 1
+    config_edit_locked "$@"; rc=$?
+    config_unlock
+    return "$rc"
+}
+config_edit_locked() {
+    local file=$1 mode=$2 key=$3 value=${4:-} target tmp line match k rest found=0 atomic=1
+    target=$(resolve "$file") || { die_soft "cannot resolve $file"; return 2; }
+    if [ -e "$target" ] && { [ ! -f "$target" ] || [ ! -r "$target" ] || [ ! -w "$target" ]; }; then
+        die_soft "configuration is not a writable regular file: $file"; return 2
+    fi
+    case $mode in remove-*) [ -f "$target" ] || return 1 ;; esac
+    mkdir -p "${target%/*}" || { die_soft "cannot create ${target%/*}"; return 2; }
+    tmp=$(mktemp "${target%/*}/.saypipe-edit.XXXXXX" 2>/dev/null) || {
+        # Some intentional symlink targets permit writes but not a sibling
+        # rename. Keep those usable, under the same writer lock.
+        [ -f "$target" ] && [ -w "$target" ] || {
+            die_soft "cannot create a replacement beside $file"; return 2;
+        }
+        tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-edit.XXXXXX") || {
+            die_soft "cannot stage configuration update for $file"; return 2;
+        }
+        atomic=0
+    }
+    CONFIG_EDIT_TMP=$tmp
+    if [ -f "$target" ]; then
+        if ! cp -p "$target" "$tmp"; then
+            rm -f "$tmp"; die_soft "cannot preserve permissions of $file"; return 2
+        fi
+    fi
+    if ! {
+        if [ -f "$target" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                if [[ $mode == *-list ]]; then
+                    match=${line%%#*}
+                    match="${match#"${match%%[![:space:]]*}"}"
+                    match="${match%"${match##*[![:space:]]}"}"
+                else
+                    read -r k rest <<< "$line"
+                    match=${k:-}
+                fi
+                if [ "$match" = "$key" ]; then found=1; else printf '%s\n' "$line"; fi
+            done < "$target"
+        else
+            printf '# saypipe configuration\n'
+        fi
+        case $mode in
+            add-list) printf '%s\n' "$key" ;;
+            set-field) printf '%s %s\n' "$key" "$value" ;;
+        esac
+    } > "$tmp"; then
+        rm -f "$tmp"; die_soft "cannot write replacement for $file"; return 2
+    fi
+    if [[ $mode == remove-* ]] && [ "$found" -eq 0 ]; then rm -f "$tmp"; return 1; fi
+    if [ "$atomic" -eq 0 ]; then
+        if ! cat "$tmp" > "$target"; then
+            rm -f "$tmp"; die_soft "cannot update $file"; return 2
+        fi
+        rm -f "$tmp"
+    elif ! mv -f -- "$tmp" "$target"; then
+        rm -f "$tmp"; die_soft "cannot replace $file"; return 2
+    fi
+}
+setting_set() { config_edit "$SETTINGS_FILE" set-field "$1" "$2"; }
 
 # alias_target <name>: the host an alias stands for (ALIASES_FILE holds
 # "<alias> <host>" lines), or failure if <name> isn't an alias.
@@ -201,16 +334,17 @@ real_host() { alias_target "$1" || printf '%s\n' "$1"; }
 # a "user@host" target matches a "host" line). Fails if there is none.
 # Commands may contain '#', so only whole-line comments count.
 default_cmd() {
-    local l k rest
+    local l k rest inherited=
     [ -r "$COMMANDS_FILE" ] || return 1
     while IFS= read -r l || [ -n "$l" ]; do
         read -r k rest <<< "$l"
         case ${k:-} in ""|"#"*) continue ;; esac
-        if { [ "$k" = "$1" ] || [ "$k" = "${1##*@}" ]; } && [ -n "${rest:-}" ]; then
-            printf '%s\n' "$rest"; return 0
-        fi
+        [ -n "${rest:-}" ] || continue
+        if [ "$k" = "$1" ]; then printf '%s\n' "$rest"; return 0; fi
+        if [ "$k" = "${1##*@}" ] && [ -z "$inherited" ]; then inherited=$rest; fi
     done < "$COMMANDS_FILE"
-    return 1
+    [ -n "$inherited" ] || return 1
+    printf '%s\n' "$inherited"
 }
 
 # default_hosts: hosts with a default command (not the global "*").
@@ -232,7 +366,15 @@ SHARE_SSH=()
 share_opts() {
     SHARE_SSH=()
     is_share_host "$1" || [ -n "${2:-}" ] || return 0
-    mkdir -p "$SHARE_DIR" 2>/dev/null && chmod 700 "${SHARE_DIR%/cm}" "$SHARE_DIR" 2>/dev/null
+    local path
+    for path in "$SHARE_RUNTIME" "${SHARE_DIR%/cm}" "$SHARE_DIR"; do
+        if [ -L "$path" ] || { [ -e "$path" ] && { [ ! -d "$path" ] || [ ! -O "$path" ]; }; }; then
+            die_soft "unsafe SSH control directory: $path"; return 1
+        fi
+        mkdir -p "$path" && chmod 700 "$path" || {
+            die_soft "cannot create private SSH control directory: $path"; return 1;
+        }
+    done
     SHARE_SSH=(-o ControlMaster=auto -o "ControlPath=$SHARE_DIR/%C"
                -o "ControlPersist=${SAYPIPE_SHARE_PERSIST:-10m}"
                -o ServerAliveInterval=15 -o ServerAliveCountMax=3)
@@ -329,11 +471,17 @@ Host options (adding one enables the host; --force works here too):
 Settings:
   --completion-hosts [all|enabled] host completion offers all ssh config hosts
                                    (default) or only enabled ones
+  --foreground, --verbose         stay attached and stream application output
+  --doctor                        inspect local tools, display and configuration
+  --version                       print the installed version
   -h, --help                       this help
 
 Environment: SAYPIPE_OPTS (waypipe options for every host), SAYPIPE_BIN_DIR
 (links), SAYPIPE_SHARE_PERSIST (shared connection lifetime, default 10m),
-SAYPIPE_WAIT (seconds to watch a launch for failure, default 2).
+SAYPIPE_WAIT (startup watch, default 2 seconds), SAYPIPE_FOREGROUND=1,
+SAYPIPE_STARTUP_WINDOW (exit-1 startup classification, default 5 seconds),
+SAYPIPE_LOG_BYTES (session output cap, default 65536 bytes),
+SAYPIPE_PROBE_TIMEOUT (post-authentication probe timeout, default 15 seconds).
 EOF
 }
 
@@ -342,51 +490,118 @@ EOF
 # Internal: the detached worker. Runs waypipe; on a real failure appends the
 # tail of its output to ERROR_LOG. If the launching saypipe is still watching
 # (SAYPIPE_STATUS names a file it waits on), report the result there.
+# Capture in bounded chunks, independently of a remote process that keeps
+# stdout open after its main command exits. Logs contain private app output.
+capture_log() {
+    local chunk= size=0
+    local LC_ALL=C
+    trap 'exit 0' TERM INT HUP
+    while :; do
+        chunk=
+        if IFS= read -r -n 4096 chunk; then
+            [ "${#chunk}" -ge 4096 ] || chunk+=$'\n'
+        else
+            [ -n "$chunk" ] || break
+        fi
+        printf '%s' "$chunk" >> "$log"
+        if [ "${SAYPIPE_FOREGROUND:-0}" = 1 ]; then printf '%s' "$chunk"; fi
+        size=$((size + ${#chunk}))
+        if [ "$size" -gt "$log_limit" ]; then
+            tail -c "$log_limit" "$log" > "$session_dir/trimmed"
+            cat "$session_dir/trimmed" > "$log"
+            size=$log_limit
+        fi
+    done
+}
+record_failure() (
+    # Separate lock scope for the state log; the worker's EXIT trap must stay
+    # in its parent, where it owns the child processes and session directory.
+    trap - EXIT INT TERM HUP
+    CONFIG_DIR=$STATE_DIR
+    CONFIG_LOCK_DEPTH=0
+    config_lock || return 1
+    chmod 700 "$STATE_DIR" 2>/dev/null || true
+    if [ -f "$ERROR_LOG" ]; then
+        tail -c 262144 "$ERROR_LOG" > "$session_dir/errors-old" || return 1
+    else
+        : > "$session_dir/errors-old"
+    fi
+    {
+        cat "$session_dir/errors-old"
+        printf '[%s] host %s: exit %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$host" "$rc"
+        tail -c "$log_limit" "$log" | sed 's/^/  /'
+    } > "$session_dir/errors-new"
+    cat "$session_dir/errors-new" > "$ERROR_LOG" || return 1
+    chmod 600 "$ERROR_LOG" 2>/dev/null || true
+    config_unlock
+)
+
 if [ "${1:-}" = "--run" ]; then
     [ $# -ge 3 ] || { echo "$SELF: --run is internal" >&2; exit 2; }
     host=$2; shift 2
-    status_file=${SAYPIPE_STATUS:-}; unset SAYPIPE_STATUS
-    log=$(mktemp "${TMPDIR:-/tmp}/saypipe.XXXXXX") || log=/dev/null
+    status_dir=${SAYPIPE_STATUS:-}; unset SAYPIPE_STATUS
+    umask 077
+    session_dir=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-session.XXXXXX") || exit 1
+    log=$session_dir/output
+    : > "$log"
+    log_limit=${SAYPIPE_LOG_BYTES:-65536}
+    [[ $log_limit =~ ^[0-9]+$ ]] && [ "$log_limit" -ge 4096 ] && [ "$log_limit" -le 1048576 ] || log_limit=65536
+    startup_window=${SAYPIPE_STARTUP_WINDOW:-5}
+    [[ $startup_window =~ ^[0-9]+$ ]] || startup_window=5
+    waypipe_pid='' capture_pid='' drain_pid='' cleaned=0
+    worker_cleanup() {
+        [ "$cleaned" = 0 ] || return 0
+        cleaned=1
+        [ -z "$waypipe_pid" ] || kill -TERM "$waypipe_pid" 2>/dev/null || true
+        [ -z "$waypipe_pid" ] || wait "$waypipe_pid" 2>/dev/null || true
+        [ -z "$capture_pid" ] || kill -TERM "$capture_pid" 2>/dev/null || true
+        [ -z "$drain_pid" ] || kill -TERM "$drain_pid" 2>/dev/null || true
+        audio_cleanup "$host"
+        rm -rf -- "$session_dir"
+    }
+    trap worker_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    [ -z "$status_dir" ] || { printf started > "$status_dir/started"; } 2>/dev/null || true
     wp_opts "$host"
-    share_opts "$host"
+    share_opts "$host" || exit 1
     audio_setup "$host" 2>>"$log"
-    # SSH joins its command arguments as shell text. Keep that interpretation
-    # (including pipelines and configured default commands) inside the private
-    # bus, and quote it as one argument for the remote POSIX sh wrapper.
+    # Only portable ASCII shell text reaches the remote login shell. Encoding
+    # avoids the different single-quote/backslash rules of fish and csh, and
+    # carries multiline commands without literal newlines in SSH's command.
     remote_command="${AUDIO_ENV[*]}${AUDIO_ENV[*]:+ }$*"
-    remote_command=${remote_command//\'/\'\\\'\'}
-    remote_session='if command -v dbus-run-session >/dev/null 2>&1; then
-    exec dbus-run-session -- "${SHELL:-/bin/sh}" -c "$1"
-else
-    exec "${SHELL:-/bin/sh}" -c "$1"
-fi'
+    remote_command=$(printf '%s' "$remote_command" | od -An -v -to1 | awk '{for (i=1;i<=NF;i++) printf "\\0%s", $i}')
+    remote_session='cmd=$(printf "%b" "$1"); if command -v dbus-run-session >/dev/null 2>&1; then exec dbus-run-session -- "${SHELL:-/bin/sh}" -c "$cmd"; else exec "${SHELL:-/bin/sh}" -c "$cmd"; fi'
+    mkfifo "$session_dir/stream" || exit 1
+    capture_log < "$session_dir/stream" & capture_pid=$!
+    started=$SECONDS
     waypipe "${WP_OPTS[@]}" ssh "${SHARE_SSH[@]}" "${AUDIO_SSH[@]}" "$host" \
-        "sh -c '$remote_session' saypipe '$remote_command'" </dev/null >>"$log" 2>&1
-    rc=$?
-    audio_cleanup "$host"
-    # Apps often exit non-zero when their window is closed (e.g. foot gives 1),
-    # so only record what means a real failure: 255 = ssh error, 127/126 =
-    # command not found / not executable, and waypipe's own "Failed to run
-    # program" (it exits 1 when the command doesn't exist on the host).
+        "sh -c '$remote_session' saypipe '$remote_command'" </dev/null >"$session_dir/stream" 2>&1 & waypipe_pid=$!
+    wait "$waypipe_pid"; rc=$?
+    waypipe_pid=''
+    # Give the reader time to drain, but never wait forever for a daemon's
+    # inherited descriptor. The watchdog never holds the capture pipe open.
+    ( sleep 1; kill -TERM "$capture_pid" 2>/dev/null || true ) </dev/null >/dev/null 2>&1 & drain_pid=$!
+    wait "$capture_pid" 2>/dev/null || true
+    kill -TERM "$drain_pid" 2>/dev/null || true
+    wait "$drain_pid" 2>/dev/null || true
+    capture_pid='' drain_pid=''
     failed=0
-    case $rc in 255|127|126) failed=1 ;; esac
-    grep -q 'Failed to run program' "$log" 2>/dev/null && failed=1
-    case $failed in
-        1)
-            if mkdir -p "$STATE_DIR" 2>/dev/null; then
-                {
-                    printf '[%s] waypipe %s ssh %s %s: exit %s\n' \
-                        "$(date '+%Y-%m-%d %H:%M:%S')" "${WP_OPTS[*]}" "$host" "$*" "$rc"
-                    tail -n 12 "$log" 2>/dev/null | sed 's/^/  /'
-                } >> "$ERROR_LOG"
-            fi ;;
-    esac
-    if [ -n "$status_file" ] && [ -e "$status_file" ]; then
-        { echo "$rc"; tail -n 12 "$log" 2>/dev/null; } > "$status_file.new" &&
-            mv -f -- "$status_file.new" "$status_file"
+    if [ "$rc" -ne 0 ]; then
+        case $rc in
+            129|130|143) ;;
+            1) if [ $((SECONDS - started)) -le "$startup_window" ] || grep -Eqi 'fatal|error|failed' "$log"; then failed=1; fi ;;
+            *) failed=1 ;;
+        esac
     fi
-    [ "$log" = /dev/null ] || rm -f "$log"
-    exit $rc
+    grep -q 'Failed to run program' "$log" 2>/dev/null && failed=1
+    [ "$failed" = 0 ] || record_failure
+    if [ -n "$status_dir" ] && [ -d "$status_dir" ]; then
+        { printf '%s\n' "$rc"; tail -c "$log_limit" "$log"; } > "$status_dir/finished.new" 2>/dev/null &&
+            mv -f -- "$status_dir/finished.new" "$status_dir/finished" 2>/dev/null || true
+    fi
+    exit "$rc"
 fi
 
 # ---- management -------------------------------------------------------------
@@ -463,22 +678,43 @@ is_enabled() {
     return 1
 }
 
-# waypipe_check <host>: reach <host> over ssh and check it has waypipe. Prints
-# the remote waypipe version, or why the check failed.
+# Framed version facts tolerate login banners without accepting an error as
+# a successful version. Both host enabling and probing use this protocol.
+WAYPIPE_REMOTE='
+if command -v waypipe >/dev/null 2>&1; then
+    v=$(waypipe --version 2>&1); rc=$?
+    printf "@@saypipe-waypipe@@%s|%s\n" "$rc" "$(printf "%s\n" "$v" | head -n 1)"
+    case $v in *"dmabuf: true"*) echo dmabuf=yes ;; *"dmabuf: false"*) echo dmabuf=no ;; esac
+else
+    echo "@@saypipe-waypipe@@127|waypipe is not installed"
+fi'
+REMOTE_VERSION=
+parse_waypipe_version() {
+    local line status version
+    REMOTE_VERSION=
+    while IFS= read -r line; do
+        case $line in
+            '@@saypipe-waypipe@@'*)
+                line=${line#@@saypipe-waypipe@@}
+                status=${line%%|*}; version=${line#*|}
+                if [ "$status" = 0 ] && [ -n "$version" ]; then
+                    REMOTE_VERSION=$version; return 0
+                fi
+                return 1 ;;
+        esac
+    done <<< "$1"
+    return 1
+}
 waypipe_check() {
     local out rc
-    share_opts "$1"
-    out=$(ssh "${SHARE_SSH[@]}" -o ConnectTimeout=10 "$1" sh -s 2>&1 <<'EOF'
-if command -v waypipe >/dev/null 2>&1; then waypipe --version 2>&1 | head -n 1
-else echo @@no-waypipe@@; fi
-EOF
-    ); rc=$?
-    if [ $rc -eq 255 ]; then printf 'cannot connect: %s\n' "$(printf '%s\n' "$out" | tail -n 1)"; return 1; fi
-    case $out in
-        *@@no-waypipe@@*) echo "waypipe is not installed there"; return 1 ;;
-        "")               echo "no answer from the host"; return 1 ;;
-    esac
-    printf '%s\n' "$out" | tail -n 1
+    share_opts "$1" || return 1
+    out=$(ssh "${SHARE_SSH[@]}" -o ConnectTimeout=10 "$1" sh -s <<< "$WAYPIPE_REMOTE" 2>&1); rc=$?
+    if [ "$rc" -ne 0 ]; then printf 'remote check failed (ssh exit %s)\n' "$rc"; return 1; fi
+    if ! parse_waypipe_version "$out"; then
+        echo "waypipe version check failed or returned no valid answer"; return 1
+    fi
+    printf '%s\n' "$REMOTE_VERSION" | tr -d '[:cntrl:]'
+    printf '\n'
 }
 
 # ensure_enabled <host>: make sure <host> is enabled, checking first that it
@@ -487,11 +723,13 @@ ensure_enabled() {
     local h=$1 v
     is_enabled "$h" && return 0
     if [ "$FORCE" = 1 ]; then
-        list_append host "$h" && echo "$h: enabled (not checked: --force)"
+        list_append host "$h" || return 1
+        echo "$h: enabled (not checked: --force)"
         return 0
     fi
     if v=$(waypipe_check "$h"); then
-        list_append host "$h" && echo "$h: enabled ($v)"
+        list_append host "$h" || return 1
+        echo "$h: enabled ($v)"
     else
         die_soft "$h: not enabled: $v (add --force to enable it without this check)"
         return 1
@@ -515,7 +753,7 @@ host_add() {
 
 # host_remove <host>...: remove hosts with all their options, aliases and links.
 host_remove() {
-    local h t kind a found
+    local h t kind a found names=()
     for h; do
         check_host "$h" || continue
         if t=$(alias_target "$h"); then
@@ -523,18 +761,40 @@ host_remove() {
             continue
         fi
         is_enabled "$h" || { die_soft "$h: not an enabled host"; continue; }
+        if [[ $h == *@* ]] && [ "$(enabled_hosts | while IFS= read -r a; do [ "$a" = "$h" ] && echo yes; done)" != yes ]; then
+            die_soft "$h: inherits configuration from ${h##*@}; remove ${h##*@} explicitly"
+            continue
+        fi
+        found=0
         for kind in host gpu audio share; do
-            host_listed "$kind" "$h" && list_drop "$kind" "$h"
+            if list_entries "$kind" | awk -v h="$h" '$0 == h { found=1 } END { exit !found }'; then
+                list_drop "$kind" "$h" || found=1
+            fi
         done
-        default_drop "$h"
-        while IFS= read -r a; do
+        [ "$found" -eq 0 ] || continue
+        if default_cmd "$h" >/dev/null; then
+            default_drop "$h"
+            [ "$?" -lt 2 ] || continue
+        fi
+        mapfile -t names < <(alias_names)
+        for a in "${names[@]}"; do
             [ "$(alias_target "$a")" = "$h" ] || continue
-            alias_drop "$a"
-            is_our_link "$LINK_DIR/$a" && rm -f -- "$LINK_DIR/$a"
+            alias_drop "$a" || { found=1; break; }
+            if is_our_link "$LINK_DIR/$a"; then
+                rm -f -- "$LINK_DIR/$a" || { die_soft "cannot remove alias link $a"; found=1; break; }
+            fi
             echo "$h: alias $a removed"
-        done < <(alias_names)
-        if is_our_link "$LINK_DIR/$h"; then rm -f -- "$LINK_DIR/$h" && echo "$h: link removed"; fi
-        echo "$h: removed (with its options)"
+        done
+        [ "$found" -eq 0 ] || continue
+        if is_our_link "$LINK_DIR/$h"; then
+            rm -f -- "$LINK_DIR/$h" || { die_soft "cannot remove $LINK_DIR/$h"; continue; }
+            echo "$h: link removed"
+        fi
+        if [[ $h == *@* ]] && is_enabled "$h"; then
+            echo "$h: exact entries removed (still inherits from ${h##*@})"
+        else
+            echo "$h: removed (with its options)"
+        fi
     done
 }
 
@@ -548,74 +808,9 @@ list_label() {
     esac
 }
 
-list_file_init() {
-    local f
-    f=$(list_file "$1")
-    [ -e "$f" ] && return 0
-    mkdir -p "${f%/*}" || return 1
-    case $1 in
-        gpu) cat > "$f" <<'EOF'
-# Hosts that saypipe runs WITHOUT -n (--no-gpu), letting apps share GPU
-# buffers (dmabufs). One host per line; blank lines and # comments are ignored.
-# A "user@host" target matches a plain "host" line.
-#
-# Only list hosts with a usable GPU (render node + Vulkan driver). Everything
-# else gets -n, which hosts without a GPU require.
-EOF
-        ;;
-        audio) cat > "$f" <<'EOF'
-# Hosts whose apps play sound here: saypipe forwards the local PulseAudio
-# socket over the ssh connection and sets PULSE_SERVER for the remote app.
-# One host per line; blank lines and # comments are ignored.
-# A "user@host" target matches a plain "host" line.
-#
-# The remote host needs a libpulse-based client stack (PipeWire's
-# pipewire-pulse or PulseAudio) and sshd with AllowStreamLocalForwarding.
-EOF
-        ;;
-        host) cat > "$f" <<'EOF'
-# saypipe's enabled hosts, added with `saypipe --host-add` once they were
-# confirmed to have waypipe. Options (gpu-hosts, audio-hosts, share-hosts,
-# commands, aliases) apply to enabled hosts; hosts that have options count as
-# enabled too. One host per line; blank lines and # comments are ignored.
-EOF
-        ;;
-        share) cat > "$f" <<'EOF'
-# Hosts whose saypipe sessions share one ssh connection (ControlMaster):
-# faster launches, and quick launches don't trip ssh rate limits such as
-# `ufw limit`. A dropped connection closes every app on that host at once.
-# One host per line; blank lines and # comments are ignored.
-# A "user@host" target matches a plain "host" line.
-EOF
-        ;;
-    esac
-}
-
-# list_append <kind> <host>: add one entry (no checks, no message).
-list_append() {
-    local f
-    list_file_init "$1" || { die_soft "cannot create $(list_file "$1")"; return 1; }
-    f=$(list_file "$1")
-    # make sure the file ends with a newline before appending
-    [ -s "$f" ] && [ -n "$(tail -c 1 "$f")" ] && echo >> "$f"
-    printf '%s\n' "$2" >> "$f" || { die_soft "cannot write $f"; return 1; }
-}
-
-# list_drop <kind> <entry>: remove exact entries (rewritten in place, keeping
-# the file's permissions and any symlink). Fails if there was none.
-list_drop() {
-    local f tmp l s found=0
-    f=$(list_file "$1")
-    [ -r "$f" ] || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-list.XXXXXX") || return 1
-    while IFS= read -r l || [ -n "$l" ]; do
-        s=${l%%#*}; s="${s#"${s%%[![:space:]]*}"}"; s="${s%"${s##*[![:space:]]}"}"
-        if [ "$s" = "$2" ]; then found=1; else printf '%s\n' "$l"; fi
-    done < "$f" > "$tmp"
-    [ $found -eq 0 ] || cat "$tmp" > "$f"
-    rm -f -- "$tmp"
-    [ $found -eq 1 ]
-}
+# Config mutation is atomic and serialized, including duplicate suppression.
+list_append() { config_edit "$(list_file "$1")" add-list "$2"; }
+list_drop() { config_edit "$(list_file "$1")" remove-list "$2"; }
 
 # option_add <kind> <host>...: enable an option (enabling the host first).
 option_add() {
@@ -633,6 +828,7 @@ option_add() {
             share) echo "$h: connection sharing enabled (applies to new launches)" ;;
         esac
     done
+    return "$mgmt_rc"
 }
 
 # option_remove <kind> <host>...
@@ -642,18 +838,25 @@ option_remove() {
     for h; do
         check_host "$h" || continue
         h=$(real_host "$h")
+        if [[ $h == *@* ]] && host_listed "$kind" "$h" &&
+           ! list_entries "$kind" | awk -v h="$h" '$0 == h { found=1 } END { exit !found }'; then
+            die_soft "$h: inherits $label from ${h##*@}; use '$SELF --$kind-remove ${h##*@}'"
+            continue
+        fi
         if list_drop "$kind" "$h"; then
+            if host_listed "$kind" "$h"; then
+                echo "$h: $label entry removed (still inherited from ${h##*@})"
+                continue
+            fi
             case $kind in
                 gpu)   echo "$h: GPU disabled (runs with -n)" ;;
                 audio) echo "$h: audio disabled" ;;
                 share) echo "$h: connection sharing disabled" \
                             "(an open master stays until '$SELF --share-exit $h' or it times out)" ;;
             esac
-            host_listed "$kind" "$h" &&
-                die_soft "$h: $label is still enabled through another entry (e.g. without user@)"
             continue
         fi
-        # "rett@myvm" lines match "myvm" only one way round: point to them.
+        # "alice@myvm" lines match "myvm" only one way round: point to them.
         e=$(list_entries "$kind" | while IFS= read -r e; do
                 [ "${e##*@}" = "$h" ] && { printf '%s\n' "$e"; break; }; done)
         if [ -n "$e" ]; then die_soft "$h: $label is enabled as '$e'; remove that entry instead"
@@ -684,7 +887,8 @@ link_remove() {
             die_soft "'$h' is an alias for $t; use '$SELF --alias-remove $h'"; continue
         fi
         t=$LINK_DIR/$h
-        if is_our_link "$t"; then rm -f -- "$t" && echo "$h: link removed"
+        if is_our_link "$t"; then
+            if rm -f -- "$t"; then echo "$h: link removed"; else die_soft "cannot remove $t"; fi
         elif [ -e "$t" ] || [ -L "$t" ]; then die_soft "$t isn't a $SELF link; not touching it"
         else die_soft "$h: no link"
         fi
@@ -693,18 +897,7 @@ link_remove() {
 
 # alias_drop <alias>: remove an alias's line from ALIASES_FILE (rewritten in
 # place, keeping permissions). Fails if there was no such alias.
-alias_drop() {
-    local l a rest tmp found=0
-    [ -r "$ALIASES_FILE" ] || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-alias.XXXXXX") || return 1
-    while IFS= read -r l || [ -n "$l" ]; do
-        read -r a rest <<< "${l%%#*}"
-        if [ "${a:-}" = "$1" ]; then found=1; else printf '%s\n' "$l"; fi
-    done < "$ALIASES_FILE" > "$tmp"
-    [ $found -eq 0 ] || cat "$tmp" > "$ALIASES_FILE"
-    rm -f -- "$tmp"
-    [ $found -eq 1 ]
-}
+alias_drop() { config_edit "$ALIASES_FILE" remove-field "$1"; }
 
 # alias_add <alias> <host>: record that <alias> means <host> and link it, for
 # a host whose name clashes with a command or that you'd rather call
@@ -725,18 +918,7 @@ alias_add() {
     if old=$(alias_target "$a") && [ "$old" = "$h" ]; then
         echo "$a: already an alias for $h"
     else
-        [ -z "$old" ] || alias_drop "$a"
-        mkdir -p "${ALIASES_FILE%/*}" || { die_soft "cannot create ${ALIASES_FILE%/*}"; return; }
-        if [ ! -e "$ALIASES_FILE" ]; then
-            cat > "$ALIASES_FILE" <<'EOF'
-# saypipe host aliases: one "<alias> <host>" per line, # comments allowed.
-# `<alias> <command>` (a link made by `saypipe --alias-add`) and
-# `saypipe <alias> <command>` connect to <host>. GPU, audio and sharing
-# settings follow <host>.
-EOF
-        fi
-        [ -s "$ALIASES_FILE" ] && [ -n "$(tail -c 1 "$ALIASES_FILE")" ] && echo >> "$ALIASES_FILE"
-        printf '%s %s\n' "$a" "$h" >> "$ALIASES_FILE" || { die_soft "cannot write $ALIASES_FILE"; return; }
+        config_edit "$ALIASES_FILE" set-field "$a" "$h" || return
         echo "$a: alias for $h${old:+ (was $old)}"
     fi
     make_link "$a"
@@ -748,7 +930,9 @@ alias_remove() {
     for a; do
         check_host "$a" alias || continue
         if alias_drop "$a"; then
-            is_our_link "$LINK_DIR/$a" && rm -f -- "$LINK_DIR/$a"
+            if is_our_link "$LINK_DIR/$a"; then
+                rm -f -- "$LINK_DIR/$a" || { die_soft "cannot remove alias link $a"; continue; }
+            fi
             echo "$a: alias removed"
         else
             die_soft "$a: not an alias"
@@ -760,18 +944,7 @@ alias_remove() {
 
 # default_drop <key>: remove a default command line (a host, or "*" for the
 # global one) from COMMANDS_FILE (rewritten in place). Fails if there was none.
-default_drop() {
-    local l k rest tmp found=0
-    [ -r "$COMMANDS_FILE" ] || return 1
-    tmp=$(mktemp "${TMPDIR:-/tmp}/saypipe-cmd.XXXXXX") || return 1
-    while IFS= read -r l || [ -n "$l" ]; do
-        read -r k rest <<< "$l"
-        if [ "${k:-}" = "$1" ]; then found=1; else printf '%s\n' "$l"; fi
-    done < "$COMMANDS_FILE" > "$tmp"
-    [ $found -eq 0 ] || cat "$tmp" > "$COMMANDS_FILE"
-    rm -f -- "$tmp"
-    [ $found -eq 1 ]
-}
+default_drop() { config_edit "$COMMANDS_FILE" remove-field "$1"; }
 
 # default_set <key> <command...>: store the command a host (or "*", the global
 # default) runs when given none, replacing an old one.
@@ -788,18 +961,7 @@ default_set() {
         ensure_enabled "$h" || return
     fi
     old=$(default_cmd "$h") || old=
-    [ -z "$old" ] || default_drop "$h"
-    mkdir -p "${COMMANDS_FILE%/*}" || { die_soft "cannot create ${COMMANDS_FILE%/*}"; return; }
-    if [ ! -e "$COMMANDS_FILE" ]; then
-        cat > "$COMMANDS_FILE" <<'EOF'
-# saypipe default commands: "<host> <command...>" per line. Running a host
-# (or an alias for it) without a command runs this one. A "*" line is the
-# global default, used for hosts without one. Only whole-line comments:
-# commands may contain '#'.
-EOF
-    fi
-    [ -s "$COMMANDS_FILE" ] && [ -n "$(tail -c 1 "$COMMANDS_FILE")" ] && echo >> "$COMMANDS_FILE"
-    printf '%s %s\n' "$h" "$c" >> "$COMMANDS_FILE" || { die_soft "cannot write $COMMANDS_FILE"; return; }
+    config_edit "$COMMANDS_FILE" set-field "$h" "$c" || return
     echo "$label: default command: $c${old:+ (was: $old)}"
 }
 
@@ -814,6 +976,11 @@ default_remove() {
         fi
         check_host "$h" || continue
         h=$(real_host "$h")
+        if [[ $h == *@* ]] && default_cmd "$h" >/dev/null &&
+           ! awk -v h="$h" '$1 == h { found=1 } END { exit !found }' "$COMMANDS_FILE"; then
+            die_soft "$h: inherits a default from ${h##*@}; use '$SELF --default-remove ${h##*@}'"
+            continue
+        fi
         if default_drop "$h"; then echo "$h: default command removed"
         else die_soft "$h: no default command"; fi
     done
@@ -919,7 +1086,7 @@ complete_list() {
             printf '%s\n' --host-add --host-remove --list --probe --gpu-add --gpu-remove \
                 --audio-add --audio-remove --share-add --share-remove --share-exit \
                 --default-set --default-remove --alias-add --alias-remove --link-add \
-                --link-remove --completion-hosts --help ;;
+                --link-remove --completion-hosts --foreground --verbose --doctor --version --help ;;
     esac
     return 0
 }
@@ -932,7 +1099,7 @@ share_exit() {
     for h; do
         check_host "$h" || continue
         h=$(real_host "$h")
-        share_opts "$h" force
+        share_opts "$h" force || continue
         if ssh "${SHARE_SSH[@]}" -O check "$h" >/dev/null 2>&1; then
             ssh "${SHARE_SSH[@]}" -O exit "$h" >/dev/null 2>&1 &&
                 echo "$h: shared connection closed (its apps close with it)"
@@ -946,14 +1113,16 @@ share_exit() {
 
 # Facts gathered on the remote host (POSIX sh, run with `sh -s` so the login
 # shell doesn't matter). One "key=value" per line.
-PROBE_REMOTE='
-if command -v waypipe >/dev/null 2>&1; then
-    v=$(waypipe --version 2>&1)
-    printf "waypipe=%s\n" "$(printf "%s\n" "$v" | head -n 1)"
-    case $v in *"dmabuf: true"*) echo dmabuf=yes ;; *"dmabuf: false"*) echo dmabuf=no ;; esac
-else
-    echo waypipe=
-fi
+PROBE_REMOTE="$WAYPIPE_REMOTE"'
+printf "shell=%s\n" "${SHELL:-/bin/sh}"
+for tool in sh dbus-run-session xdg-desktop-portal; do
+    if command -v "$tool" >/dev/null 2>&1; then printf "tool=%s\n" "$tool"; fi
+done
+for d in /usr/share /usr/local/share; do
+    for f in "$d"/xdg-desktop-portal/portals/*.portal; do
+        [ -f "$f" ] && printf "portal=%s\n" "${f##*/}"
+    done
+done
 for n in /dev/dri/renderD*; do
     [ -c "$n" ] || continue
     if [ -r "$n" ] && [ -w "$n" ]; then echo "render=$n"; else echo "render_noaccess=$n"; fi
@@ -966,23 +1135,71 @@ fi
 
 # probe_row <name> <result> [<detail>]
 probe_row() {
-    if [ -n "${3:-}" ]; then printf '  %-8s %-7s %s\n' "$1" "$2" "$3"
-    else printf '  %-8s %s\n' "$1" "$2"; fi
+    local result detail
+    result=$(printf '%s' "$2" | tr -d '[:cntrl:]')
+    detail=$(printf '%s' "${3:-}" | tr -d '[:cntrl:]')
+    if [ -n "$detail" ]; then printf '  %-8s %-7s %s\n' "$1" "$result" "$detail"
+    else printf '  %-8s %s\n' "$1" "$result"; fi
 }
+
+# Bound post-authentication SSH sessions using only shell primitives.
+bounded_probe() {
+    local child timer sleeper rc marker
+    marker=$(mktemp "$dir/timeout.XXXXXX") || return 1
+    "$@" <&3 & child=$!
+    bounded_cancel() {
+        local status=$1
+        trap - INT TERM HUP
+        kill -TERM "$child" "${timer:-}" 2>/dev/null || true
+        wait "$child" 2>/dev/null || true
+        [ -z "${timer:-}" ] || wait "$timer" 2>/dev/null || true
+        rm -f "$marker"
+        exit "$status"
+    }
+    trap 'bounded_cancel 130' INT
+    trap 'bounded_cancel 143' TERM
+    trap 'bounded_cancel 129' HUP
+    (
+        trap 'kill "$sleeper" 2>/dev/null || true; exit 0' TERM INT
+        sleep "${SAYPIPE_PROBE_TIMEOUT:-15}" & sleeper=$!
+        wait "$sleeper" || exit 0
+        printf timeout > "$marker"
+        kill -TERM "$child" 2>/dev/null || true
+        sleep 1
+        kill -KILL "$child" 2>/dev/null || true
+    ) </dev/null >/dev/null 2>&1 & timer=$!
+    wait "$child"; rc=$?
+    kill "$timer" 2>/dev/null || true
+    wait "$timer" 2>/dev/null || true
+    trap - INT TERM HUP
+    if [ -s "$marker" ]; then rm -f "$marker"; echo "saypipe: remote probe timed out" >&2; return 124; fi
+    rm -f "$marker"
+    return "$rc"
+} 3<&0
 
 # probe_host <host> <apply>: test ssh, connection sharing, GPU and audio support
 # on <host> over one temporary shared connection (one TCP connection in total,
 # so ssh rate limits aren't tripped), print the results and what to enable.
-probe_host() {
+probe_host() (
     local h=$1 apply=$2 dir m key val facts res
     local wp='' dmabuf='' render='' noaccess='' vulkaninfo='' hwdev='' cpudev=''
     local share=no share_why gpu=no gpu_why audio=no audio_why lsock rsock out
     local feat enabled=() suggest=() wrong=() shown=() f add_host=0
+    local remote_shell='' dbus=no portal=no backends='' rc=0
+    mgmt_rc=0
 
     dir=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-probe.XXXXXX") || { die_soft "cannot create a temp dir"; return; }
     m=(-o "ControlPath=$dir/%C" -o ConnectTimeout=10)
+    probe_cleanup() {
+        ssh "${m[@]}" -O exit "$h" </dev/null >/dev/null 2>&1 || true
+        rm -rf -- "$dir"
+    }
+    trap probe_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
     echo "$h"
-    if ! ssh "${m[@]}" -o ControlMaster=yes -o ControlPersist=no -fN "$h"; then
+    if ! ssh "${m[@]}" -o ControlMaster=yes -o ControlPersist=30 -fN "$h"; then
         probe_row ssh FAILED "cannot connect (see the ssh error above)"
         rm -rf -- "$dir"; mgmt_rc=1; return
     fi
@@ -990,15 +1207,19 @@ probe_host() {
 
     # Everything else runs as extra sessions over that connection; if they
     # work, connection sharing works.
-    if facts=$(ssh "${m[@]}" -o ControlMaster=no "$h" sh -s <<< "$PROBE_REMOTE"); then
+    if facts=$(bounded_probe ssh "${m[@]}" -o ControlMaster=no "$h" sh -s <<< "$PROBE_REMOTE"); then
         share=yes; share_why="extra sessions reuse one connection"
     else
+        rc=$?
+        case $rc in 129|130|143) return "$rc" ;; esac
         share_why="sessions over a shared connection failed"
-        facts=$(ssh "${m[@]}" -o ControlMaster=no -o ControlPath=none "$h" sh -s <<< "$PROBE_REMOTE") || facts=
+        facts=$(bounded_probe ssh "${m[@]}" -o ControlMaster=no -o ControlPath=none "$h" sh -s <<< "$PROBE_REMOTE") || facts=
     fi
     while IFS='=' read -r key val; do
         case $key in
-            waypipe)         wp=$val ;;
+            shell) remote_shell=$val ;;
+            tool) case $val in dbus-run-session) dbus=yes ;; xdg-desktop-portal) portal=yes ;; esac ;;
+            portal) backends="${backends:+$backends, }$val" ;;
             dmabuf)          dmabuf=$val ;;
             render)          render=${render:-$val} ;;
             render_noaccess) noaccess=${noaccess:-$val} ;;
@@ -1008,6 +1229,10 @@ probe_host() {
         esac
     done <<< "$facts"
 
+    if parse_waypipe_version "$facts"; then wp=$REMOTE_VERSION; else mgmt_rc=1; fi
+    probe_row shell "${remote_shell:-unknown}"
+    probe_row dbus "$dbus" "${dbus/yes/private session per launch}"
+    probe_row portal "$portal" "${backends:-no backend files found}"
     if [ -n "$wp" ]; then probe_row waypipe ok "$wp${dmabuf:+ (dmabuf: $dmabuf)}"
     else probe_row waypipe MISSING "install waypipe on $h"; fi
 
@@ -1027,13 +1252,16 @@ probe_host() {
         audio_why="no local PulseAudio socket at $lsock"
     else
         rsock=/tmp/saypipe-probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n').sock
-        if out=$(ssh "${m[@]}" -o ControlMaster=no -o ExitOnForwardFailure=yes \
+        if out=$(bounded_probe ssh "${m[@]}" -o ControlMaster=no -o ExitOnForwardFailure=yes \
                      -R "$rsock:$lsock" "$h" sh -s 2>/dev/null <<EOF
 if command -v pactl >/dev/null 2>&1; then
     PULSE_SERVER=unix:$rsock pactl info 2>/dev/null | sed -n 's/^Server Name: //p'
 elif [ -S $rsock ]; then
-    if ls /usr/lib/libpulse.so.0 /usr/lib*/libpulse.so.0 /usr/lib/*/libpulse.so.0 >/dev/null 2>&1
-    then echo socket+libpulse; else echo socket-only; fi
+    r=socket-only
+    for f in /usr/lib*/libpulse.so* /usr/lib/*/libpulse.so* /usr/local/lib/libpulse.so*; do
+        [ -e "\$f" ] && { r=socket+libpulse; break; }
+    done
+    echo "\$r"
 fi
 rm -f $rsock
 EOF
@@ -1041,16 +1269,15 @@ EOF
             case $out in
                 "")             audio_why="forwarded, but nothing on $h could talk to it" ;;
                 socket+libpulse) audio=yes; audio_why="socket forwarding works; libpulse present" ;;
-                socket-only)    audio_why="socket forwarding works, but no libpulse/pactl on $h" ;;
+                socket-only)    audio=likely; audio_why="socket forwarding works; libpulse/pactl not found on $h" ;;
                 *)              audio=yes; audio_why="reached local sound server: $out" ;;
             esac
         else
-            audio_why="sshd on $h refused the socket forward (AllowStreamLocalForwarding?)"
+            rc=$?
+            if [ "$rc" -eq 124 ]; then audio_why="remote audio probe timed out"; mgmt_rc=1
+            else audio_why="sshd on $h refused the socket forward (AllowStreamLocalForwarding?)"; fi
         fi
     fi
-    ssh "${m[@]}" -O exit "$h" >/dev/null 2>&1
-    rm -rf -- "$dir"
-
     probe_row shared "$share" "$share_why"
     probe_row gpu "$gpu" "$gpu_why"
     probe_row audio "$audio" "$audio_why"
@@ -1079,7 +1306,10 @@ EOF
     else probe_row options none; fi
     if [ ${#suggest[@]} -gt 0 ]; then
         if [ "$apply" = 1 ]; then
-            for feat in "${suggest[@]}"; do option_add "$feat" "$h" | sed 's/^/  /'; done
+            for feat in "${suggest[@]}"; do
+                option_add "$feat" "$h" | sed 's/^/  /'
+                [ "${PIPESTATUS[0]}" -eq 0 ] || mgmt_rc=1
+            done
         else
             for feat in "${suggest[@]}"; do echo "  -> $SELF --$feat-add $h"; done
         fi
@@ -1089,7 +1319,8 @@ EOF
     for feat in ${wrong[@]+"${wrong[@]}"}; do
         echo "  !  $feat is enabled but not supported here: $SELF --$feat-remove $h"
     done
-}
+    return "$mgmt_rc"
+)
 
 # probe <apply> <host>...
 probe() {
@@ -1097,8 +1328,49 @@ probe() {
     for h; do
         check_host "$h" || continue
         if t=$(alias_target "$h"); then echo "($h is an alias for $t)"; h=$t; fi
-        probe_host "$h" "$apply"
+        probe_host "$h" "$apply" || mgmt_rc=1
     done
+}
+
+# Local, read-only diagnostics. These checks never activate D-Bus services or
+# attempt a remote login; --probe owns the authenticated remote checks.
+doctor() {
+    local tool version socket file bad=0
+    for tool in bash ssh waypipe sh; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            probe_row "$tool" missing; bad=1; continue
+        fi
+        case $tool in
+            bash) version=$BASH_VERSION ;;
+            ssh) version=$(ssh -V 2>&1 | head -n 1) ;;
+            waypipe) version=$(waypipe --version 2>&1 | head -n 1) ;;
+            sh) version=available ;;
+        esac
+        probe_row "$tool" ok "$version"
+    done
+    socket=${WAYLAND_DISPLAY:-}
+    case $socket in
+        /*) ;;
+        '') probe_row display missing 'WAYLAND_DISPLAY is unset'; bad=1 ;;
+        *) socket=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$socket ;;
+    esac
+    if [ -n "$socket" ]; then
+        if [ -S "$socket" ]; then probe_row display ok 'Wayland socket exists'
+        else probe_row display missing 'Wayland socket is unavailable'; bad=1; fi
+    fi
+    if [ -S "${SSH_AUTH_SOCK:-/nonexistent}" ]; then probe_row agent available
+    else probe_row agent unknown 'no agent socket; --probe verifies remote authentication'; fi
+    if [ -d "$CONFIG_DIR" ]; then
+        for file in hosts gpu-hosts audio-hosts share-hosts aliases commands settings; do
+            if [ -e "$CONFIG_DIR/$file" ] || [ -L "$CONFIG_DIR/$file" ]; then
+                if [ -f "$CONFIG_DIR/$file" ] && [ -r "$CONFIG_DIR/$file" ]; then probe_row config ok "$file"
+                else probe_row config invalid "$file"; bad=1; fi
+            fi
+        done
+    else probe_row config fresh 'no saved host settings'; fi
+    if [ -d "$CONFIG_DIR/.lock" ]; then probe_row lock present 'configuration update is active or interrupted'; fi
+    probe_row remote unknown 'use --probe HOST to check remote D-Bus and portal availability'
+    return "$bad"
 }
 
 # ---- command line ---------------------------------------------------------------
@@ -1117,10 +1389,25 @@ take_flag() {
 # need_hosts <option>: ARGS must hold at least one host.
 need_hosts() { [ ${#ARGS[@]} -gt 0 ] || usage_error "$1 needs at least one host"; }
 
+if [ -z "$host" ]; then
+    while [ $# -gt 0 ]; do
+        case $1 in
+            --foreground|--verbose) export SAYPIPE_FOREGROUND=1; shift ;;
+            *) break ;;
+        esac
+    done
+fi
+
 if [ -z "$host" ] && [ $# -gt 0 ] && [[ $1 == -* ]] && [ "$1" != -- ]; then
     op=$1; shift
     ARGS=("$@")
     case $op in
+        --doctor)
+            [ $# -eq 0 ] || usage_error "$op takes no arguments"
+            doctor; exit "$?" ;;
+        --version)
+            [ $# -eq 0 ] || usage_error "$op takes no arguments"
+            printf 'saypipe %s\n' "$VERSION"; exit 0 ;;
         -h|--help)
             [ $# -eq 0 ] || usage_error "$op takes no arguments"
             usage; exit 0 ;;
@@ -1202,31 +1489,51 @@ fi
 # SAYPIPE_WAIT seconds (default 2), so a launch that fails right away (ssh
 # error, command not found) is reported here instead of only in ERROR_LOG.
 launch() {
-    local h=$1 status rc step=0.1 max n=0
-    status=$(mktemp "${TMPDIR:-/tmp}/saypipe-status.XXXXXX" 2>/dev/null) || status=
-    # Detach completely (new session, no terminal), so closing the shell or
-    # terminal doesn't kill waypipe. setsid -f is util-linux; elsewhere (BSD,
-    # busybox without -f) fall back to nohup.
+    local h=$1 status='' rc step=0.1 max n=0 launch_pid=''
+    launch_cleanup() {
+        if [ -n "$launch_pid" ]; then
+            kill -TERM "$launch_pid" 2>/dev/null || true
+            wait "$launch_pid" 2>/dev/null || true
+        fi
+        [ -z "$status" ] || rm -rf -- "$status"
+    }
+    trap launch_cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+    if [ "${SAYPIPE_FOREGROUND:-0}" = 1 ]; then
+        "$0" --run "$@" & launch_pid=$!
+        wait "$launch_pid"; rc=$?
+        launch_pid=
+        launch_cleanup
+        trap - EXIT INT TERM HUP
+        return "$rc"
+    fi
+    status=$(mktemp -d "${TMPDIR:-/tmp}/saypipe-status.XXXXXX") || {
+        echo "$SELF: cannot create startup status directory" >&2
+        launch_cleanup
+        trap - EXIT INT TERM HUP
+        return 1;
+    }
     if ! SAYPIPE_STATUS=$status setsid -f "$0" --run "$@" </dev/null >/dev/null 2>&1; then
         SAYPIPE_STATUS=$status nohup "$0" --run "$@" </dev/null >/dev/null 2>&1 &
     fi
-    [ -n "$status" ] || return 0
-    sleep "$step" 2>/dev/null || step=1               # no fractional sleep: whole seconds
+    sleep "$step" 2>/dev/null || step=1
     max=$(awk -v w="${SAYPIPE_WAIT:-2}" -v s="$step" 'BEGIN { printf "%d", w / s }')
-    while [ $n -lt "$max" ] && [ ! -s "$status" ]; do sleep "$step"; n=$((n + 1)); done
+    while [ "$n" -lt "$max" ] && [ ! -s "$status/finished" ]; do sleep "$step"; n=$((n + 1)); done
     rc=0
-    if [ -s "$status" ]; then
-        # The app ended while we were watching: any error exit this early
-        # means it didn't start (e.g. the command doesn't exist there).
-        rc=$(head -n 1 "$status")
+    if [ -s "$status/finished" ]; then
+        rc=$(head -n 1 "$status/finished")
         if [ "$rc" != 0 ]; then
-            {
-                printf '%s: %s on %s failed (exit %s):\n' "$SELF" "${*:2}" "$h" "$rc"
-                tail -n +2 "$status" | sed 's/^/  /'
-            } >&2
+            printf '%s: %s on %s failed (exit %s):\n' "$SELF" "${*:2}" "$h" "$rc" >&2
+            tail -n +2 "$status/finished" | sed 's/^/  /' >&2
         fi
+    elif [ ! -s "$status/started" ]; then
+        echo "$SELF: detached worker did not start; try --foreground" >&2
+        rc=1
     fi
-    rm -f -- "$status"
+    launch_cleanup
+    trap - EXIT INT TERM HUP
     return "$rc"
 }
 
