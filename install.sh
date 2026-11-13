@@ -83,13 +83,16 @@ install_copy() {
 # GNU readlink -f. (POSIX sh has no local variables, hence the _r prefix.)
 resolve() {
     _rp=$1 _rn=0
-    if readlink -f -- / >/dev/null 2>&1; then readlink -f -- "$_rp"; return; fi
+    if readlink -f -- / >/dev/null 2>&1; then
+        readlink -f -- "$_rp" 2>/dev/null && return
+    fi
     if have realpath; then realpath -- "$_rp" 2>/dev/null && return; fi
     while [ -L "$_rp" ] && [ $_rn -lt 40 ]; do
         _rl=$(readlink -- "$_rp") || break
         case $_rl in /*) _rp=$_rl ;; *) _rp=${_rp%/*}/$_rl ;; esac
         _rn=$((_rn + 1))
     done
+    [ ! -L "$_rp" ] || return 1
     _rd=$(cd -P -- "$(dirname -- "$_rp")" 2>/dev/null && pwd -P) || return 1
     printf '%s/%s\n' "$_rd" "${_rp##*/}"
 }

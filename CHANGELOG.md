@@ -8,6 +8,8 @@ follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Fall back to portable path resolution when readlink cannot canonicalize a new configuration file, preserve cyclic symlinks instead of replacing them, and use FreeBSD’s base tcsh in CI.
+
 - Preserve unexpected startup and delayed launch failures in bounded private logs, and clean up workers and forwarded audio sockets on interruption.
 - Serialize atomic configuration updates, preserve symlink targets and permissions, and report write failures accurately.
 - Require exact entries for removals and prefer exact user-qualified default commands.
