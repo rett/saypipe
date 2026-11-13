@@ -1,4 +1,4 @@
-# Runs the project's shell syntax checks on pull requests and on pushes to develop.
+# Runs the project's checks on pull requests and on pushes to develop.
 name: test
 
 on:
@@ -26,5 +26,5 @@ jobs:
           fetch-tags: true
       - name: Install completion shells
         run: sudo apt-get update && sudo apt-get install -y zsh fish
-      - name: Shell syntax checks
+      - name: Checks
         run: make test
