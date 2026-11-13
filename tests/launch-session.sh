@@ -16,10 +16,15 @@ cat > "$test_dir/local/waypipe" <<'MOCK'
 while [ "$1" != ssh ]; do shift; done
 shift
 shift # host (these tests have no sharing or audio forwarding)
-PATH=$TEST_REMOTE_BIN exec /bin/sh -c "$*"
+SHELL=${TEST_REMOTE_SHELL:-/bin/sh} PATH=$TEST_REMOTE_BIN exec /bin/sh -c "$*"
 MOCK
 chmod +x "$test_dir/local/waypipe"
 export PATH=$test_dir/local:$PATH
+
+# Keep the remote login shell's command syntax, with or without a private bus.
+bash_command='items=(one "two three"); printf "%s" "${items[1]}" > "$TEST_OUTPUT"'
+TEST_REMOTE_SHELL=$(command -v bash) "$project_dir/saypipe" --run testhost "$bash_command"
+[ "$(cat "$TEST_OUTPUT")" = 'two three' ]
 
 # With no remote dbus-run-session, preserve shell evaluation and exit status.
 "$project_dir/saypipe" --run testhost 'printf "%s" "fallback" > "$TEST_OUTPUT"'
@@ -44,6 +49,9 @@ chmod +x "$TEST_REMOTE_BIN/dbus-run-session"
 "$project_dir/saypipe" --run testhost $'printf first > "$TEST_OUTPUT"\nprintf second >> "$TEST_OUTPUT"'
 [ "$(cat "$TEST_OUTPUT")" = firstsecond ]
 
+TEST_REMOTE_SHELL=$(command -v bash) "$project_dir/saypipe" --run testhost "$bash_command"
+[ "$(cat "$TEST_OUTPUT")" = 'two three' ]
+
 # Configured defaults take the same path through the public command entry.
 mkdir -p "$XDG_CONFIG_HOME/saypipe"
 printf '%s\n' 'testhost printf default > "$TEST_OUTPUT"' > "$XDG_CONFIG_HOME/saypipe/commands"
@@ -55,7 +63,7 @@ for expected in 1 126 127; do
     "$project_dir/saypipe" --run testhost "exit $expected" || actual=$?
     [ "$actual" = "$expected" ]
 done
-[ "$(wc -l < "$TEST_BUS_STARTS")" -eq 7 ]
+[ "$(wc -l < "$TEST_BUS_STARTS")" -eq 8 ]
 grep -q 'exit 127' "$XDG_STATE_HOME/saypipe/errors.log"
 # When installed, exercise two real session buses through the worker too.
 real_dbus=$(command -v dbus-run-session || true)

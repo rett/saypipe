@@ -356,9 +356,9 @@ if [ "${1:-}" = "--run" ]; then
     remote_command="${AUDIO_ENV[*]}${AUDIO_ENV[*]:+ }$*"
     remote_command=${remote_command//\'/\'\\\'\'}
     remote_session='if command -v dbus-run-session >/dev/null 2>&1; then
-    exec dbus-run-session -- sh -c "$1"
+    exec dbus-run-session -- "${SHELL:-/bin/sh}" -c "$1"
 else
-    exec sh -c "$1"
+    exec "${SHELL:-/bin/sh}" -c "$1"
 fi'
     waypipe "${WP_OPTS[@]}" ssh "${SHARE_SSH[@]}" "${AUDIO_SSH[@]}" "$host" \
         "sh -c '$remote_session' saypipe '$remote_command'" </dev/null >>"$log" 2>&1
