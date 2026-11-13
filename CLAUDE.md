@@ -4,7 +4,7 @@
 
 ## Commands
 
-- Whole test suite: `make test`. Run it once after a set of related changes is merged, not after every edit.
+- Whole test suite: `make test`. Run it at the completed-feature checkpoint before merging into develop. It checks shell syntax.
 - While working on a task, run only the check that covers what you changed.
 
 ## Rules

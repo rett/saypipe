@@ -16,6 +16,10 @@ The branching model is git-flow, as its author described it.
 - While working on a task, run the targeted check that covers your change.
 - When a feature is complete, run the whole suite once on it before it is merged into `develop`: `make test`.
 
+`make test` checks shell syntax. It also checks zsh and fish completions when those shells are installed. Remote launches, audio, GPU buffers and SSH connection sharing require validation with a suitable host. Report checks performed and any unavailable coverage.
+
+Run `make bootstrap` to check development tools and `make doctor` to diagnose missing tools. See README.md for application installation.
+
 ## Changes
 
 - Every user-visible change gets a changelog entry under `[Unreleased]`, in the same commit as the change.

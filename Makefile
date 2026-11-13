@@ -1,12 +1,20 @@
-# Set up and check a checkout. Fill in both targets, then describe them in the
-# "Development environment" section of AGENTS.md.
-.PHONY: bootstrap doctor
+.PHONY: bootstrap doctor test
 
-bootstrap:
-	@echo "bootstrap: nothing is installed yet."
-	@echo "Edit this target so it installs what the project needs, idempotently (sudo only on the lines that need root)."
+# Development checks need no downloaded dependencies or application installation.
+bootstrap: doctor
+	@echo "Development tools are ready. See README.md to install saypipe."
 
 doctor:
-	@echo "missing: the doctor target checks nothing yet."
-	@echo "Edit it to print one line per item (the tool and its version), starting a line with missing when an item is absent."
-	@false
+	@command -v git >/dev/null || { echo "missing: git"; exit 1; }
+	@command -v bash >/dev/null || { echo "missing: bash 4.4 or newer"; exit 1; }
+	@bash -c '(( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) ))' || { echo "missing: bash 4.4 or newer"; exit 1; }
+	@command -v sh >/dev/null || { echo "missing: POSIX sh"; exit 1; }
+	@echo "ok: git, bash 4.4 or newer, POSIX sh, make"
+
+test: doctor
+	bash -n saypipe
+	sh -n install.sh
+	bash -n scripts/build-waypipe.sh
+	bash -n completions/saypipe.bash
+	@if command -v zsh >/dev/null; then zsh -n completions/_saypipe; else echo "skip: zsh completion syntax (zsh unavailable)"; fi
+	@if command -v fish >/dev/null; then fish -n completions/saypipe.fish; else echo "skip: fish completion syntax (fish unavailable)"; fi

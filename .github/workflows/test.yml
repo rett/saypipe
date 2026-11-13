@@ -1,4 +1,4 @@
-# Runs the project's whole test suite on pull requests and on pushes to develop.
+# Runs the project's shell syntax checks on pull requests and on pushes to develop.
 name: test
 
 on:
@@ -24,5 +24,7 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
           fetch-tags: true
-      - name: Tests
+      - name: Install completion shells
+        run: sudo apt-get update && sudo apt-get install -y zsh fish
+      - name: Shell syntax checks
         run: make test
